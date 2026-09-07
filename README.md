@@ -12,9 +12,11 @@ bound, empirical finite-range convergence slopes, and computation time.
 
 ## Installation
 
-Create an environment, open a terminal in the repository root, and run:
+Clone the repository, create an environment, and install the dependencies:
 
 ```bash
+git clone https://github.com/wangjialefr-hub/rmab-benchmark-suite.git
+cd rmab-benchmark-suite
 python -m pip install -r requirements.txt
 ```
 
@@ -63,6 +65,15 @@ Main entry points:
 
 See `JUPYTER_RUN_GUIDE.md` for the complete execution order.
 
+The same experiments can be started outside Jupyter:
+
+```bash
+python run_instance_matrix_benchmark.py
+python run_heterogeneous_benchmark.py
+python run_unknown_model_benchmark.py
+python run_computation_cost_suite.py
+```
+
 ## Project Structure
 
 - `bandit_lp.py`, `strategies.py`: reference RMAB and policy implementations.
@@ -92,6 +103,5 @@ See `JUPYTER_RUN_GUIDE.md` for the complete execution order.
 
 ## Attribution
 
-`bandit_lp.py` and `strategies.py` were provided by Nicolas Gast. Read
-`ATTRIBUTION.md` before publishing or redistributing the repository. A private
-repository is recommended until permission and licensing are confirmed.
+`bandit_lp.py` and `strategies.py` were provided by Nicolas Gast and are
+included here with his permission. See `ATTRIBUTION.md` for details.

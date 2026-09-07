@@ -18,3 +18,8 @@ RMAB_Report_Figures/
 Code_Description*/
 final_known_model_run_*.log
 final_known_model_run_pid.txt
+
+# Local project notes, kept outside the public release
+FINAL_STATUS.md
+README_FOR_PAPER.md
+LPUPDATE_V2_TODO.md

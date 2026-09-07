@@ -206,6 +206,10 @@ def cached_simulate_policy(
         lp_update_horizon=lp_update_horizon,
     )
 
+    # The reference simulator writes its own cache to this relative folder.
+    # A fresh clone does not contain generated directories, so create it here.
+    Path("computed_values").mkdir(parents=True, exist_ok=True)
+
     start = time.perf_counter()
     mean_reward, x_values, reward_values, y_values = strategies.simulate(
         bandit=bandit,

@@ -1,18 +1,17 @@
 # RMAB Benchmark Suite
 
-This repository provides a reproducible benchmark for restless multi-armed
-bandit (RMAB) policies. It covers three regimes:
+This repository contains the code developed for a benchmarking study of
+restless multi-armed bandit (RMAB) policies. Its main purpose is to run several
+policies under one experimental protocol, rather than compare numbers produced
+by unrelated scripts.
 
-1. homogeneous arms with known transition and reward models;
-2. heterogeneous arms with arm-dependent models;
-3. online learning when the policy does not know the model.
+The primary benchmark assumes that the transition and reward models are known.
+The repository also contains smaller extensions for heterogeneous arms and
+unknown-model online learning.
 
-The benchmark reports average reward, relative gap to the relaxed LP upper
-bound, empirical finite-range convergence slopes, and computation time.
+## Start Here
 
-## Installation
-
-Clone the repository, create an environment, and install the dependencies:
+Clone the repository and install the dependencies:
 
 ```bash
 git clone https://github.com/wangjialefr-hub/rmab-benchmark-suite.git
@@ -20,15 +19,26 @@ cd rmab-benchmark-suite
 python -m pip install -r requirements.txt
 ```
 
-## Quick Start
+Then run the quick end-to-end check:
 
-The smallest public interface runs one named instance-policy pair:
+```bash
+python smoke_test.py
+```
+
+This executes one small experiment twice. The first run computes the result and
+the second reuses it from a temporary cache. A successful installation prints
+`Smoke test passed` and `Cache behavior: miss -> hit`.
+
+## Run One Experiment
+
+`benchmark_api.py` is the simplest entry point. It can be used from a Python
+script or a Jupyter notebook:
 
 ```python
 from benchmark_api import available_policies, list_instances, run_named_experiment
 
 print(available_policies())
-display(list_instances())
+print(list_instances().head(10).to_string(index=False))
 
 result = run_named_experiment(
     "random_S10_seed123",
@@ -37,71 +47,81 @@ result = run_named_experiment(
     horizon=200,
     seed=123,
 )
-print(result["mean_reward"], result["relative_gap"], result["cache_hit"])
+
+print("Mean reward:", result["mean_reward"])
+print("Relative gap:", result["relative_gap"])
+print("Cache hit:", result["cache_hit"])
 ```
 
-Users can evaluate their own homogeneous known-model instance with
-`run_custom_experiment(P, R, policy_name, alpha=...)`. Here `P` has shape
-`(S, 2, S)` and `R` has shape `(S, 2)`.
+To use a new homogeneous instance, call
+`run_custom_experiment(P, R, policy_name, alpha=...)`. The transition tensor
+`P` must have shape `(S, 2, S)`, and the reward matrix `R` must have shape
+`(S, 2)`.
 
-## Full Experiments
+## Run the Full Benchmarks
 
-From Jupyter, first change into the cloned repository and then run a script:
+The full sweeps are much slower than the smoke test. In particular, LP-Update
+performs optimization during simulation and QWhittleKnownModel has a separate
+training phase. Start with the smoke test or one API call before launching a
+complete run.
+
+| Script | Experiment | Output folder |
+|---|---|---|
+| `run_instance_matrix_benchmark.py` | Known-model homogeneous arms | `instance_matrix_outputs/` |
+| `run_heterogeneous_benchmark.py` | Known-model heterogeneous arms | `heterogeneous_outputs/` |
+| `run_unknown_model_benchmark.py` | Unknown-model online learning | `unknown_model_outputs/` |
+| `run_computation_cost_suite.py` | Setup and online computation time | `computation_cost_suite_outputs/` |
+| `generate_paper_figures.py` | Paper-level summary figures | `paper_summary_outputs/figures/` |
+
+From Jupyter:
 
 ```python
 %cd "C:/path/to/rmab-benchmark-suite"
 %run "run_instance_matrix_benchmark.py"
 ```
 
-Main entry points:
-
-| Script | Experiment | Output folder |
-|---|---|---|
-| `run_instance_matrix_benchmark.py` | Known-model homogeneous benchmark | `instance_matrix_outputs/` |
-| `run_heterogeneous_benchmark.py` | Known-model heterogeneous benchmark | `heterogeneous_outputs/` |
-| `run_unknown_model_benchmark.py` | Unknown-model online learning | `unknown_model_outputs/` |
-| `run_computation_cost_suite.py` | Computation-cost study | `computation_cost_suite_outputs/` |
-| `generate_paper_figures.py` | Paper-level figures | `paper_summary_outputs/figures/` |
-
-See `JUPYTER_RUN_GUIDE.md` for the complete execution order.
-
-The same experiments can be started outside Jupyter:
+From a terminal:
 
 ```bash
 python run_instance_matrix_benchmark.py
-python run_heterogeneous_benchmark.py
-python run_unknown_model_benchmark.py
-python run_computation_cost_suite.py
 ```
 
-## Project Structure
+The generated data, figures, and caches are intentionally not committed to the
+repository. See `JUPYTER_RUN_GUIDE.md` for the recommended execution order and
+the location of each output.
 
-- `bandit_lp.py`, `strategies.py`: reference RMAB and policy implementations.
-- `make_policy.py`: unified policy factory and added baselines.
-- `rmab_instances.py`, `known_model_extra_instances.py`: instance library.
-- `simulation_cache.py`: deterministic cache keyed by model and experiment settings.
+## Repository Map
+
+- `bandit_lp.py`, `strategies.py`: reference RMAB classes, policies, and simulator.
+- `make_policy.py`: common policy factory and added baselines.
+- `rmab_instances.py`, `known_model_extra_instances.py`: named instance library.
+- `simulation_cache.py`: cache keyed by the model and experiment settings.
+- `benchmark_api.py`: importable interface for named or user-supplied instances.
 - `heterogeneous_rmab.py`: heterogeneous-arm models and policies.
-- `unknown_model_learning.py`: online-learning policies.
-- `benchmark_api.py`: compact importable interface for external users.
-- `paper_config.py`, `generate_*`, `check_*`: paper tables, figures, and checks.
+- `unknown_model_learning.py`: exploratory online-learning policies.
+- `run_*.py`: experiment runners.
+- `generate_*.py`, `check_*.py`: report figures, tables, and consistency checks.
 
 ## Reproducibility Notes
 
-- Experiment seeds and horizons are declared near the top of each runner.
-- Cached reward experiments are stored in `rmab_cache/`; set
-  `force_recompute=True` in the relevant API when a fresh run is required.
-- Timing experiments must bypass reward caches. Reusing a cached result measures
-  file loading, not policy execution.
-- A fitted convergence value is a descriptive log-log slope over the tested
-  finite set of `N` values, not a proof of an asymptotic rate.
-- A negative empirical LP gap can occur through finite-horizon transients or
-  Monte Carlo error and should not be interpreted as defeating the LP bound.
-- `FTVA_Strategy` is incompatible with some current maintenance and deadline
-  instances; failed combinations are recorded instead of silently omitted.
-- The current `LPupdateStrategy` is the available reference implementation; a
-  newer LP-Update variant is listed as future work in `LPUPDATE_V2_TODO.md`.
+- Seeds, horizons, and tested values of `N` are declared near the top of each runner.
+- Reward experiments use `rmab_cache/`. Pass `force_recompute=True` through the
+  public API when a fresh result is required.
+- Timing experiments bypass the reward cache. Loading a cached file is not a
+  measurement of policy execution time.
+- The reported convergence coefficient is a descriptive log-log slope over the
+  tested values of `N`; it is not a proof of an asymptotic rate.
+- A small negative empirical LP gap can arise from finite-horizon transients or
+  Monte Carlo error.
+- Unsupported policy-instance combinations are recorded as failures rather than
+  silently removed from the result files.
 
-## Attribution
+The known-model benchmark is the main contribution. The heterogeneous and
+unknown-model experiments are useful extensions, but their instance sets and
+evaluation protocols are intentionally smaller.
 
-`bandit_lp.py` and `strategies.py` were provided by Nicolas Gast and are
-included here with his permission. See `ATTRIBUTION.md` for details.
+## Reference Code
+
+`bandit_lp.py` and `strategies.py` were provided by Nicolas Gast and are included
+with his permission. The benchmark framework and extensions were developed
+around those files. See `ATTRIBUTION.md` for the redistribution note.

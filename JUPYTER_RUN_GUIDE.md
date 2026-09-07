@@ -1,10 +1,11 @@
-# Jupyter Run Guide
+# Running the Benchmark from Jupyter
 
-Use this file when running the benchmark from the Jupyter web interface.
+This guide starts with a small installation check and then lists the full
+experiments. Run only the sections needed for the result you want to reproduce.
 
-## 0. Set Working Folder
+## 1. Open the Repository
 
-Run this first:
+Change `ROOT` to the folder where the repository was cloned:
 
 ```python
 from pathlib import Path
@@ -15,75 +16,70 @@ os.chdir(ROOT)
 print("Current folder:", Path.cwd())
 ```
 
-## 1. Known-Model Homogeneous Benchmark
+## 2. Check the Installation
 
-This is the main benchmark for known transition matrix `P` and reward matrix
-`R`.
+```python
+%run "smoke_test.py"
+```
+
+The expected final messages are:
+
+```text
+Smoke test passed.
+Cache behavior: miss -> hit
+```
+
+## 3. Try One Instance and Policy
+
+```python
+from benchmark_api import run_named_experiment
+
+result = run_named_experiment(
+    "random_S10_seed123",
+    "WhittleIndexStrategy",
+    N=100,
+    horizon=200,
+    seed=123,
+)
+result
+```
+
+Running the same cell again should return `cache_hit=True`.
+
+## 4. Run the Experiment Families
+
+Known-model homogeneous benchmark:
 
 ```python
 %run "run_instance_matrix_benchmark.py"
 ```
 
-Output folder:
-
-```text
-instance_matrix_outputs/
-```
-
-This script can be slow the first time. Later runs reuse `rmab_cache`.
-
-## 2. Heterogeneous-Arm Benchmark
-
-Use this when arms have different `P_i, R_i`.
+Known-model heterogeneous benchmark:
 
 ```python
 %run "run_heterogeneous_benchmark.py"
 ```
 
-Output folder:
-
-```text
-heterogeneous_outputs/
-```
-
-## 3. Unknown-Model Online-Learning Benchmark
-
-Use this when policies do not know `P, R` and must learn from samples.
+Unknown-model online-learning benchmark:
 
 ```python
 %run "run_unknown_model_benchmark.py"
 ```
 
-Output folder:
-
-```text
-unknown_model_outputs/
-```
-
-## 4. Computation-Cost Summary
-
-Fast version, reusing existing timing CSV files:
-
-```python
-from run_computation_cost_suite import collect_existing_computation_cost_outputs
-collect_existing_computation_cost_outputs()
-```
-
-Full rerun version, slower:
+Computation-cost benchmark:
 
 ```python
 %run "run_computation_cost_suite.py"
 ```
 
-Output folder:
+The first homogeneous run can take a long time. It includes expensive policies
+and many instance-policy-seed combinations. Completed reward simulations are
+stored in `rmab_cache/`, so an unchanged rerun can reuse them. Timing experiments
+are deliberately uncached.
 
-```text
-computation_cost_suite_outputs/
-```
+## 5. Regenerate Report Outputs
 
-## 5. Regenerate Paper Tables, Figures, and Draft
-
-Run these after experiments:
+Run this block after the required experiments have completed:
 
 ```python
 %run "detect_duplicate_instances.py"
@@ -91,20 +87,17 @@ Run these after experiments:
 %run "generate_benchmark_findings.py"
 %run "generate_paper_figures.py"
 %run "check_paper_readiness.py"
-%run "generate_paper_draft.py"
 ```
 
-Output folder:
+## Output Folders
 
-```text
-paper_summary_outputs/
-```
+| Folder | Contents |
+|---|---|
+| `instance_matrix_outputs/` | Homogeneous rewards, gaps, convergence fits, and plots |
+| `heterogeneous_outputs/` | Heterogeneous rewards and runtimes |
+| `unknown_model_outputs/` | Learning summaries and learning curves |
+| `computation_cost_suite_outputs/` | Setup, online, and total runtime summaries |
+| `paper_summary_outputs/` | Filtered tables and paper-level figures |
+| `rmab_cache/` | Reusable homogeneous reward simulations |
 
-## 6. Files to Read Before Meeting
-
-Read these in order:
-
-1. `FINAL_STATUS.md`
-2. `README_FOR_PAPER.md`
-3. `paper_summary_outputs\RMAB_paper_initial_draft.md`
-4. `paper_summary_outputs\paper_readiness_report.md`
+All of these folders are generated locally and excluded from Git.

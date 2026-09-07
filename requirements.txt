@@ -1,0 +1,5 @@
+numpy
+pandas
+matplotlib
+pulp
+markovianbandit-pkg==0.4

@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Generated caches and experiment outputs
+rmab_cache/
+computed_values/
+instance_matrix_outputs/
+heterogeneous_outputs/
+unknown_model_outputs/
+computation_cost_outputs/
+computation_cost_suite_outputs/
+paper_summary_outputs/
+RMAB_Report_Figures/
+
+# Historical local copies and run logs
+Code_Description*/
+final_known_model_run_*.log
+final_known_model_run_pid.txt

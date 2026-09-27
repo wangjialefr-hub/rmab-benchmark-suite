@@ -5,7 +5,16 @@ import numpy as np
 import hashlib
 import bandit_lp
 import os
-import markovianbandit
+from simulation_utils import (
+    SIMULATION_VERSION, activation_probabilities, integer_budget, state_counts,
+)
+
+# markovianbandit 0.4 changes NumPy's global error settings on import.
+_numpy_error_settings = np.geterr()
+try:
+    import markovianbandit
+finally:
+    np.seterr(**_numpy_error_settings)
 
 if not os.path.exists('computed_values/'):
     os.makedirs('computed_values/')
@@ -142,7 +151,8 @@ class WhittleIndexStrategy(PriorityStrategy):
         Priority according to Whittle index for the specific instance of bandit. 
         """
         bandit_instance = markovianbandit.RestlessBandit(bandit.P, bandit.R)
-        self.whittle_indices = bandit_instance.whittle_indices()
+        with np.errstate(divide="raise", invalid="raise"):
+            self.whittle_indices = bandit_instance.whittle_indices()
         PriorityStrategy.__init__(self, np.flip(np.argsort(self.whittle_indices)), alpha)
 
 
@@ -158,10 +168,18 @@ class FTVA_Strategy(AbstractStrategy):
         self.bandit = bandit
         self.alpha = alpha
         _ , y_star, _, _ = bandit.relaxed_lp_average_reward(alpha)
-        self.pi_star = y_star[:,1] / np.sum(y_star, 1) # optimal policy for the relaxed problem
+        self.pi_star = activation_probabilities(y_star)
+        self.x_star = np.maximum(y_star.sum(axis=1), 0)
+        self.x_star /= self.x_star.sum()
+        self.reset()
+
+    def reset(self):
+        """Discard arm states before starting a new replication."""
         self.S = None
         self.S_virtual = None
         self.Y = None
+        self.X = None
+        self.reward = None
 
     def hashname(self):
         """
@@ -180,19 +198,13 @@ class FTVA_Strategy(AbstractStrategy):
         assert isinstance(N, int), "this strategy is not defined for infinite N"
         if self.S is None or len(self.S) != N:
             #This means that we never called this function: we need to initialize
-            self.S = np.zeros(N, dtype=int) # states of all bandits
-            n=0
-            for i in range(self.bandit.S):
-                for j in range(int(N*state_x[i])):
-                    self.S[n] = i
-                    n+=1
-            for n in range(n, N):
-                self.S[n] = np.random.choice(len(state_x), p = state_x)
-            self.S_virtual = np.copy(self.S)
+            self.S = np.repeat(np.arange(self.bandit.S), state_counts(state_x, N))
+            # Algorithm 1 starts independent virtual arms in LP stationarity.
+            self.S_virtual = np.random.choice(self.bandit.S, size=N, p=self.x_star)
 
-        budget = int(self.alpha*N)
+        budget = integer_budget(self.alpha, N)
 
-        A_virtual = np.array([np.random.rand() <= self.pi_star[self.S_virtual[i]] for i in range(N)], dtype=int)
+        A_virtual = np.array([np.random.rand() < self.pi_star[self.S_virtual[i]] for i in range(N)], dtype=int)
         A = np.copy(A_virtual)
         truncate_to_budget(A, budget)
 
@@ -250,22 +262,30 @@ def hashname(bandit, strategy, initial_state, N, time, seed):
     """
     h = hashlib.new('sha256')
     h.update(np.array(initial_state).view())
-    return 'computed_values/{}_{}_{}_N{}_T{}_seed{}.npz'.format(bandit.hashname(), strategy.hashname(),
+    return 'computed_values/{}_{}_{}_{}_N{}_T{}_seed{}.npz'.format(SIMULATION_VERSION, bandit.hashname(), strategy.hashname(),
                                                         h.hexdigest()[0:10], N, time, seed)
 
 def round_state_to_integer(vector, N):
     """
     Returns an array close to 'vector' so that array[i]*N is an integer
     """
-    array = np.array([int(N*x_0_i)/N for x_0_i in vector])
-    if np.sum(array) < 1:
-        array[0] += 1- np.sum(array)
-    else:
-        for i in range(len(array)):
-            array[i] = max(0, array[i] - np.sum(array) +1)
-    return array
+    if N == np.inf:
+        return np.asarray(vector, dtype=float).copy()
+    return state_counts(vector, N) / N
 
-def simulate(bandit: bandit_lp.BanditInstance, strategy: AbstractStrategy, initial_state, N, time, verbose=False, seed=None):
+
+def simulation_step(bandit, strategy, state_x, N):
+    """Execute one decision and return next state, reward, executed allocation."""
+    y = strategy.next_y(state_x, N)
+    if not np.allclose(np.sum(y, axis=1), state_x, atol=1e-7, rtol=0):
+        raise ValueError("Policy allocation does not match the current state distribution.")
+    if strategy.X is None:
+        budget = None if N == np.inf else integer_budget(strategy.alpha, N)
+        return bandit.next_x_from_y(y, N, return_y=True, budget=budget)
+    # FTVA and RoundRobin already choose integer actions and advance real arms.
+    return strategy.X, strategy.reward, y
+
+def simulate(bandit: bandit_lp.BanditInstance, strategy: AbstractStrategy, initial_state, N, time, verbose=False, seed=None, *, use_cache=True, force_recompute=False):
     """
     This simulates a bandit with a given strategy. 
 
@@ -276,12 +296,14 @@ def simulate(bandit: bandit_lp.BanditInstance, strategy: AbstractStrategy, initi
     - N : can be finite or np.inf
     - time = time-horizon (integer)
     """
+    if not isinstance(time, (int, np.integer)) or time <= 0:
+        raise ValueError("Simulation time must be a positive integer.")
     filename = hashname(bandit, strategy, initial_state, N , time, seed)
     try:
-        if seed is None:
-            assert False
-        file = np.load(filename)
-        reward_values, x_values, y_values = file['arr_0'], file['arr_1'], file['arr_2']
+        if seed is None or not use_cache or force_recompute:
+            raise FileNotFoundError("Simulation cache bypassed.")
+        with np.load(filename, allow_pickle=False) as file:
+            reward_values, x_values, y_values = file['arr_0'], file['arr_1'], file['arr_2']
         if np.max(np.abs(np.sum(x_values, 1)-1)) > 1e-6:
             print("There is a problem with the number of bandits:{}", np.max(np.abs(np.sum(x_values, 1)-1)))
             assert False
@@ -289,6 +311,8 @@ def simulate(bandit: bandit_lp.BanditInstance, strategy: AbstractStrategy, initi
         if verbose:
             print('we need to recompute', filename, 'because', err)
         np.random.seed(seed)
+        if hasattr(strategy, "reset"):
+            strategy.reset()
         state_x = round_state_to_integer(initial_state, N)
         x_values = np.zeros(shape=(time, bandit.S))
         y_values = np.zeros(shape=(time, bandit.S, bandit.A))
@@ -296,18 +320,13 @@ def simulate(bandit: bandit_lp.BanditInstance, strategy: AbstractStrategy, initi
         cumulative_reward = 0
         for t in range(time):
             x_values[t] = state_x
-            next_y = strategy.next_y(state_x, N)
-            y_values[t] = next_y
-            if strategy.X is None:
-                next_x, reward = bandit.next_x_from_y(next_y, N)
-            else:
-                next_x = strategy.X
-                reward = strategy.reward
+            next_x, reward, executed_y = simulation_step(bandit, strategy, state_x, N)
+            y_values[t] = executed_y
             reward_values[t] = reward
             if verbose:
                 print(state_x, reward, cumulative_reward)
             state_x = next_x
-        if seed is not None:
+        if seed is not None and use_cache:
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
             np.savez_compressed(filename, reward_values, x_values, y_values)
     return np.mean(reward_values), x_values, reward_values, y_values
-

@@ -5,6 +5,7 @@ This script does not run simulations. It reads the outputs produced by the
 benchmark scripts and creates aggregate figures suitable for a report draft.
 """
 
+import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -12,11 +13,17 @@ import numpy as np
 import pandas as pd
 
 from paper_config import filter_paper_instances
+from report_data import (
+    CORRECTED_DATA, CORRECTED_REPORT, complete_reward_ranks,
+    load_corrected_results, write_manifest,
+)
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = CURRENT_DIR / "paper_summary_outputs"
+OUTPUT_DIR = CORRECTED_REPORT
 FIGURE_DIR = OUTPUT_DIR / "figures"
+REPORT_SCOPE = ""
+GENERATED_FIGURES = []
 
 POLICY_DISPLAY_NAMES = {
     "WhittleIndexStrategy": "Whittle",
@@ -59,7 +66,7 @@ def configure_matplotlib():
     )
 
 
-def plot_heatmap(matrix, title, colorbar_label, filename, cmap="viridis", fmt=".2g"):
+def plot_heatmap(matrix, title, colorbar_label, filename, cmap="viridis", fmt=".2g", center_zero=False):
     if matrix.empty:
         return
 
@@ -71,8 +78,13 @@ def plot_heatmap(matrix, title, colorbar_label, filename, cmap="viridis", fmt=".
     fig_height = max(4.5, 0.38 * len(matrix.index) + 1.8)
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
-    im = ax.imshow(masked_values, aspect="auto", cmap=cmap)
-    ax.set_title(title)
+    limits = {}
+    if center_zero:
+        finite = values[np.isfinite(values)]
+        limit = max(float(np.max(np.abs(finite))), 1e-12) if finite.size else 1
+        limits = dict(vmin=-limit, vmax=limit)
+    im = ax.imshow(masked_values, aspect="auto", cmap=cmap, **limits)
+    ax.set_title(f"{title}\n{REPORT_SCOPE}" if REPORT_SCOPE else title)
     ax.set_xticks(np.arange(len(matrix.columns)))
     ax.set_xticklabels(
         display_policy_names(matrix.columns),
@@ -92,48 +104,35 @@ def plot_heatmap(matrix, title, colorbar_label, filename, cmap="viridis", fmt=".
                     ha="center",
                     va="center",
                     fontsize=7,
-                    color="white" if values[i, j] > np.nanmean(values) else "black",
+                    color="black" if np.mean(im.cmap(im.norm(values[i, j]))[:3]) > 0.5 else "white",
                 )
 
     cbar = fig.colorbar(im, ax=ax)
     cbar.set_label(colorbar_label)
     fig.tight_layout()
     fig.savefig(FIGURE_DIR / filename, bbox_inches="tight")
+    GENERATED_FIGURES.append(FIGURE_DIR / filename)
     plt.close(fig)
 
 
 def reward_rank_matrix(summary_df, N):
     """Return instance-by-policy reward ranks for one population size."""
-    df = summary_df[summary_df["N"] == N].copy()
-    df["reward_rank"] = df.groupby("instance")["mean_reward"].rank(
-        method="min",
-        ascending=False,
-    )
-    return df.pivot(index="instance", columns="policy", values="reward_rank")
+    return complete_reward_ranks(summary_df, N)
 
 
 def policy_order_from_largest_n(summary_df):
     """Order policies by mean reward rank at the largest available N."""
     max_n = summary_df["N"].max()
     matrix = reward_rank_matrix(summary_df, max_n)
-    return matrix.mean(axis=0, skipna=True).sort_values().index.tolist()
+    return matrix.mean(axis=0).sort_values(kind="stable").index.tolist()
 
 
 def plot_known_model_rank_heatmap(summary_final):
     if summary_final.empty:
         return
 
-    df = summary_final.copy()
-    df["reward_rank"] = df.groupby("instance")["mean_reward"].rank(
-        method="min",
-        ascending=False,
-    )
-    matrix = df.pivot(
-        index="instance",
-        columns="policy",
-        values="reward_rank",
-    )
-    policy_order = matrix.mean(axis=0, skipna=True).sort_values().index
+    matrix = reward_rank_matrix(summary_final, summary_final["N"].max())
+    policy_order = policy_order_from_largest_n(summary_final)
     matrix = matrix.reindex(columns=policy_order)
     plot_heatmap(
         matrix=matrix,
@@ -141,7 +140,7 @@ def plot_known_model_rank_heatmap(summary_final):
         colorbar_label="Rank, lower is better",
         filename="known_model_reward_rank_heatmap.png",
         cmap="viridis_r",
-        fmt=".0f",
+        fmt=".1f",
     )
 
 
@@ -155,9 +154,15 @@ def plot_known_model_rank_overview(summary_df, detail_n_values=(20, 100, 200)):
     largest_matrix = reward_rank_matrix(summary_df, max_n).reindex(
         columns=policy_order
     )
-
-    fig = plt.figure(figsize=(13.5, 10.5))
-    grid = fig.add_gridspec(2, 3, height_ratios=(2.2, 1.0), hspace=0.48, wspace=0.28)
+    if largest_matrix.empty:
+        return
+    available_n = set(summary_df["N"].astype(int)) - {max_n}
+    selected_n = [int(N) for N in detail_n_values if int(N) in available_n][:3]
+    if not selected_n:
+        selected_n = sorted(available_n)[:3]
+    fig = plt.figure(figsize=(13.5, 10.5 if selected_n else 6.5))
+    grid = fig.add_gridspec(2 if selected_n else 1, max(1, len(selected_n)),
+                          height_ratios=(2.2, 1.0) if selected_n else (1,), hspace=0.48, wspace=0.28)
     main_ax = fig.add_subplot(grid[0, :])
 
     values = largest_matrix.to_numpy(dtype=float)
@@ -169,7 +174,7 @@ def plot_known_model_rank_overview(summary_df, detail_n_values=(20, 100, 200)):
         vmax=max(2, len(policy_order)),
     )
     main_ax.set_title(
-        f"Reward rank at N={max_n}; policies ordered by mean rank"
+        f"Reward rank at N={max_n}; policies ordered by mean rank\n{REPORT_SCOPE}"
     )
     main_ax.set_xticks(np.arange(len(policy_order)))
     main_ax.set_xticklabels(
@@ -185,18 +190,17 @@ def plot_known_model_rank_overview(summary_df, detail_n_values=(20, 100, 200)):
                 main_ax.text(
                     column,
                     row,
-                    f"{values[row, column]:.0f}",
+                    f"{values[row, column]:.1f}",
                     ha="center",
                     va="center",
                     fontsize=7,
+                    color="black" if np.mean(image.cmap(image.norm(values[row, column]))[:3]) > 0.5 else "white",
                 )
     colorbar = fig.colorbar(image, ax=main_ax, fraction=0.025, pad=0.02)
     colorbar.set_label("Reward rank (lower is better)")
 
-    available_n = set(summary_df["N"].astype(int))
-    selected_n = [int(N) for N in detail_n_values if int(N) in available_n]
     for ax, N in zip(
-        [fig.add_subplot(grid[1, i]) for i in range(3)],
+        [fig.add_subplot(grid[1, i]) for i in range(len(selected_n))],
         selected_n,
     ):
         matrix = reward_rank_matrix(summary_df, N).reindex(columns=policy_order)
@@ -207,7 +211,7 @@ def plot_known_model_rank_overview(summary_df, detail_n_values=(20, 100, 200)):
             marker="o",
             linewidth=1.5,
         )
-        ax.set_title(f"Mean reward rank at N={N}")
+        ax.set_title(f"Mean reward rank at N={N}\n{len(matrix)} shared instances")
         ax.set_xticks(np.arange(len(policy_order)))
         ax.set_xticklabels(
             display_policy_names(policy_order),
@@ -223,6 +227,7 @@ def plot_known_model_rank_overview(summary_df, detail_n_values=(20, 100, 200)):
         FIGURE_DIR / "known_model_reward_rank_overview.png",
         bbox_inches="tight",
     )
+    GENERATED_FIGURES.append(FIGURE_DIR / "known_model_reward_rank_overview.png")
     plt.close(fig)
 
     pd.DataFrame(
@@ -242,21 +247,21 @@ def plot_known_model_gap_heatmap(summary_final, policy_order=None):
         return
 
     df = summary_final.copy()
-    df["display_gap"] = df["mean_relative_gap"].clip(lower=0.0)
     matrix = df.pivot(
         index="instance",
         columns="policy",
-        values="display_gap",
+        values="mean_relative_gap",
     )
     if policy_order is not None:
         matrix = matrix.reindex(columns=policy_order)
     plot_heatmap(
         matrix=matrix,
-        title="Known-model clipped relative gap at largest N",
-        colorbar_label="max(relative gap, 0)",
+        title="Signed relative difference to stationary LP at largest N",
+        colorbar_label="(stationary LP - empirical reward) / |stationary LP|",
         filename="known_model_relative_gap_heatmap.png",
-        cmap="magma_r",
+        cmap="RdBu_r",
         fmt=".2g",
+        center_zero=True,
     )
 
 
@@ -273,8 +278,8 @@ def plot_beta_heatmap(beta_df, policy_order=None):
         matrix = matrix.reindex(columns=policy_order)
     plot_heatmap(
         matrix=matrix,
-        title="Estimated convergence rate beta",
-        colorbar_label="beta, higher is faster",
+        title="Descriptive log-log slope (beta)",
+        colorbar_label="beta over retained positive-gap points",
         filename="convergence_beta_heatmap.png",
         cmap="viridis",
         fmt=".2g",
@@ -366,13 +371,14 @@ def plot_heterogeneous_reward(heterogeneous_summary):
 def normalized_score(series, higher_is_better):
     """Min-max normalize one criterion so that 1 always means better."""
     series = pd.to_numeric(series, errors="coerce")
+    series = series.where(np.isfinite(series))
     finite = series[np.isfinite(series)]
     if finite.empty:
         return pd.Series(np.nan, index=series.index)
     lower = finite.min()
     upper = finite.max()
     if np.isclose(lower, upper):
-        return pd.Series(1.0, index=series.index)
+        return pd.Series(np.where(np.isfinite(series), 1.0, np.nan), index=series.index)
     score = (series - lower) / (upper - lower)
     return score if higher_is_better else 1.0 - score
 
@@ -435,9 +441,14 @@ def plot_heterogeneous_normalized_scores(heterogeneous_summary):
     ].to_csv(OUTPUT_DIR / "heterogeneous_normalized_scores.csv", index=False)
 
 
-def generate_paper_figures(output_dir=OUTPUT_DIR, figure_dir=None):
-    global OUTPUT_DIR, FIGURE_DIR
+def generate_paper_figures(output_dir=CORRECTED_REPORT, figure_dir=None, *, known_model_dir=CORRECTED_DATA):
+    """Build corrected known-model figures; never import historical extensions."""
+    global OUTPUT_DIR, FIGURE_DIR, REPORT_SCOPE, GENERATED_FIGURES
+    known_summary, beta_df, manifest = load_corrected_results(known_model_dir)
+    REPORT_SCOPE = manifest["report_scope"]
+    GENERATED_FIGURES = []
     OUTPUT_DIR = Path(output_dir)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     FIGURE_DIR = (
         Path(figure_dir)
         if figure_dir is not None
@@ -446,32 +457,7 @@ def generate_paper_figures(output_dir=OUTPUT_DIR, figure_dir=None):
     FIGURE_DIR.mkdir(parents=True, exist_ok=True)
     configure_matplotlib()
 
-    summary_final = read_csv_if_exists(
-        CURRENT_DIR / "instance_matrix_outputs" / "summary_final_N500.csv"
-    )
-    summary_final = filter_paper_instances(summary_final)
-    known_summary = read_csv_if_exists(
-        CURRENT_DIR / "instance_matrix_outputs" / "summary_instance_matrix.csv"
-    )
-    known_summary = filter_paper_instances(known_summary)
-    beta_df = read_csv_if_exists(
-        CURRENT_DIR / "instance_matrix_outputs" / "convergence_beta_by_instance.csv"
-    )
-    beta_df = filter_paper_instances(beta_df)
-    combined_cost = read_csv_if_exists(
-        CURRENT_DIR
-        / "computation_cost_suite_outputs"
-        / "combined_computation_cost_ranking.csv"
-    )
-    known_cost = read_csv_if_exists(
-        CURRENT_DIR / "paper_summary_outputs" / "known_model_cost_ranking.csv"
-    )
-    unknown_summary = read_csv_if_exists(
-        CURRENT_DIR / "unknown_model_outputs" / "unknown_model_summary.csv"
-    )
-    heterogeneous_summary = read_csv_if_exists(
-        CURRENT_DIR / "heterogeneous_outputs" / "heterogeneous_summary.csv"
-    )
+    summary_final = known_summary[known_summary["N"] == known_summary["N"].max()].copy()
 
     policy_order = policy_order_from_largest_n(known_summary)
 
@@ -479,9 +465,6 @@ def generate_paper_figures(output_dir=OUTPUT_DIR, figure_dir=None):
     plot_known_model_rank_overview(known_summary)
     plot_known_model_gap_heatmap(summary_final, policy_order)
     plot_beta_heatmap(beta_df, policy_order)
-    plot_cost_bar(combined_cost if not combined_cost.empty else known_cost)
-    plot_unknown_tail_reward(unknown_summary)
-    plot_heterogeneous_reward(heterogeneous_summary)
 
     figure_index = pd.DataFrame(
         [
@@ -489,16 +472,19 @@ def generate_paper_figures(output_dir=OUTPUT_DIR, figure_dir=None):
                 "figure": file.name,
                 "path": str(file),
             }
-            for file in sorted(FIGURE_DIR.glob("*.png"))
+            for file in GENERATED_FIGURES
         ]
     )
     figure_index.to_csv(OUTPUT_DIR / "paper_figure_index.csv", index=False)
+    write_manifest(OUTPUT_DIR, manifest)
 
     print(f"Saved paper figures to:\n{FIGURE_DIR}")
     return figure_index
 
 
 if __name__ == "__main__":
-    FIGURES = generate_paper_figures(
-        figure_dir=OUTPUT_DIR / "figures"
-    )
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--known-model-dir", type=Path, default=CORRECTED_DATA)
+    parser.add_argument("--output-dir", type=Path, default=CORRECTED_REPORT)
+    args = parser.parse_args()
+    FIGURES = generate_paper_figures(output_dir=args.output_dir, known_model_dir=args.known_model_dir)

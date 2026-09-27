@@ -6,8 +6,8 @@ explicitly:
 
     arm i has its own P_i, R_i, and current state states[i].
 
-The existing teacher files are reused for BanditInstance and Whittle-index
-computation, but they are not modified.
+BanditInstance and Whittle-index computation reuse the reference modules.
+Local simulator corrections are documented in ATTRIBUTION.md.
 """
 
 from dataclasses import dataclass
@@ -16,6 +16,7 @@ import numpy as np
 import pulp
 
 import strategies
+from simulation_utils import activation_probabilities, integer_budget
 from known_model_extra_instances import (
     maintenance_degradation_instance,
     wireless_channel_instance,
@@ -61,7 +62,7 @@ class HeterogeneousRMAB:
 
     @property
     def budget(self):
-        return int(self.alpha * self.N)
+        return integer_budget(self.alpha, self.N)
 
 
 class HeterogeneousPolicy:
@@ -169,7 +170,7 @@ def solve_heterogeneous_average_lp(environment):
             for group_id, group in enumerate(groups)
             for s in range(group["arm"].S)
         )
-        == environment.alpha
+        == environment.budget / environment.N
     ), "resource"
 
     for group_id, group in enumerate(groups):
@@ -280,7 +281,7 @@ def solve_heterogeneous_finite_lp(environment, x_by_group, time_horizon):
                 for group_id, group in enumerate(groups)
                 for s in range(group["arm"].S)
             )
-            == environment.alpha
+            == environment.budget / environment.N
         ), f"resource_{t}"
 
     for group_id, group in enumerate(groups):
@@ -456,9 +457,9 @@ class HeterogeneousFTVAPolicy(HeterogeneousPolicy):
         super().__init__(environment)
         self.groups, self.arm_to_group = _get_model_groups(environment)
         lp_solution = solve_heterogeneous_average_lp(environment)
-        self.pi_by_group = _activation_probabilities_from_y(
-            lp_solution["y_by_group"]
-        )
+        self.pi_by_group = [activation_probabilities(y) for y in lp_solution["y_by_group"]]
+        self.x_by_group = [np.maximum(y.sum(axis=1), 0) for y in lp_solution["y_by_group"]]
+        self.x_by_group = [x / x.sum() for x in self.x_by_group]
         self.virtual_states = None
         self.last_virtual_actions = None
         self.last_virtual_states = None
@@ -472,7 +473,11 @@ class HeterogeneousFTVAPolicy(HeterogeneousPolicy):
     def select_actions(self, states):
         states = np.asarray(states, dtype=int)
         if self.virtual_states is None or len(self.virtual_states) != self.N:
-            self.virtual_states = states.copy()
+            # Independent virtual states start at each model's LP stationary law.
+            self.virtual_states = np.array([
+                self.rng.choice(len(self.x_by_group[k]), p=self.x_by_group[k])
+                for k in self.arm_to_group
+            ])
 
         self.last_virtual_states = self.virtual_states.copy()
         probabilities = np.array(
@@ -482,7 +487,7 @@ class HeterogeneousFTVAPolicy(HeterogeneousPolicy):
             ]
         )
         virtual_actions = (
-            self.rng.random(self.N) <= probabilities
+            self.rng.random(self.N) < probabilities
         ).astype(int)
         actions = _repair_binary_actions_to_budget(
             virtual_actions,
@@ -533,6 +538,11 @@ class HeterogeneousLPUpdatePolicy(HeterogeneousPolicy):
         self.groups, self.arm_to_group = _get_model_groups(environment)
         self.time_horizon = int(time_horizon)
         self.computed_scores = {}
+
+    def reset(self, seed):
+        super().reset(seed)
+        # Reuse solves within a trajectory, never across timed replications.
+        self.computed_scores.clear()
 
     def select_actions(self, states):
         states = np.asarray(states, dtype=int)
@@ -641,6 +651,10 @@ def simulate_heterogeneous(environment, policy, horizon, seed):
     Reward is normalized by N, matching the scale used by the homogeneous
     benchmark.
     """
+    if isinstance(horizon, (bool, np.bool_)) or not isinstance(horizon, (int, np.integer)) or horizon <= 0:
+        raise ValueError("horizon must be a positive integer.")
+    if policy.environment is not environment:
+        raise ValueError("Policy and simulator must use the same environment.")
     environment_rng = np.random.default_rng(seed)
     policy.reset(seed + 1)
 
@@ -657,9 +671,12 @@ def simulate_heterogeneous(environment, policy, horizon, seed):
     reward_history = np.zeros(horizon)
 
     for t in range(horizon):
-        actions = np.asarray(policy.select_actions(states), dtype=int)
+        actions = np.asarray(policy.select_actions(states))
         if actions.shape != (environment.N,):
             raise ValueError("Policy returned an action vector with wrong shape.")
+        if not np.isin(actions, [0, 1]).all():
+            raise ValueError("Policy actions must be binary (0 or 1), not rounded scores.")
+        actions = actions.astype(int)
         if np.sum(actions) != environment.budget:
             raise ValueError("Policy did not satisfy the exact activation budget.")
 

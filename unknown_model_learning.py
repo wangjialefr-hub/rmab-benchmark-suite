@@ -6,12 +6,23 @@ making decisions or updating their internal tables. The simulator still uses the
 true bandit as the hidden environment, exactly as a physical system would.
 
 Known-model oracle policies are included only as reference curves.
+All arms' states, realized rewards and transitions (including passive arms)
+are observed. A shared table pools samples from homogeneous arms. Plug-in
+Whittle is model-based learning; Q-difference ranking is a heuristic, not a
+Whittle-index estimator or a solution of the coupled N-arm control problem.
 """
 
 import numpy as np
 
 import bandit_lp
 import strategies
+from benchmark_metadata import positive_integer
+from simulation_utils import integer_budget
+
+
+def _check_exploration(start, minimum):
+    if not (np.isfinite(start) and np.isfinite(minimum) and 0 <= minimum <= start <= 1):
+        raise ValueError("Exploration probabilities must satisfy 0 <= epsilon_min <= epsilon_start <= 1.")
 
 
 class UnknownModelPolicy:
@@ -20,11 +31,12 @@ class UnknownModelPolicy:
     def __init__(self, S, A, N, alpha):
         if A != 2:
             raise ValueError("The current benchmark assumes two actions.")
-        self.S = int(S)
+        self.S = positive_integer(S, "S")
         self.A = int(A)
-        self.N = int(N)
-        self.alpha = float(alpha)
-        self.budget = int(self.alpha * self.N)
+        self.N = positive_integer(N, "N")
+        self.requested_alpha = float(alpha)
+        self.budget = integer_budget(self.requested_alpha, self.N)
+        self.alpha = self.budget / self.N
         self.rng = np.random.default_rng(0)
         self.t = 0
 
@@ -51,11 +63,13 @@ class UnknownModelPolicy:
         return actions
 
     def _activate_largest_scores(self, scores):
+        scores = np.asarray(scores, dtype=float)
+        if scores.shape != (self.N,) or not np.isfinite(scores).all():
+            raise ValueError("Priority scores must be finite and have one entry per arm.")
         actions = np.zeros(self.N, dtype=int)
         if self.budget == 0:
             return actions
 
-        scores = np.asarray(scores, dtype=float)
         tie_breaker = self.rng.uniform(0.0, 1e-12, size=self.N)
         selected = np.argpartition(
             scores + tie_breaker,
@@ -95,6 +109,9 @@ class OnlineRewardGreedyPolicy(UnknownModelPolicy):
         self.epsilon_start = float(epsilon_start)
         self.epsilon_min = float(epsilon_min)
         self.optimistic_value = float(optimistic_value)
+        _check_exploration(self.epsilon_start, self.epsilon_min)
+        if not np.isfinite(self.optimistic_value):
+            raise ValueError("optimistic_value must be finite.")
         self.reward_sum = None
         self.reward_count = None
 
@@ -143,6 +160,8 @@ class OnlineUCBRewardPolicy(OnlineRewardGreedyPolicy):
     def __init__(self, S, A, N, alpha, ucb_scale=1.0):
         super().__init__(S, A, N, alpha, epsilon_start=0.0, epsilon_min=0.0)
         self.ucb_scale = float(ucb_scale)
+        if not np.isfinite(self.ucb_scale) or self.ucb_scale < 0:
+            raise ValueError("ucb_scale must be finite and nonnegative.")
 
     def _ucb_mean(self, state, action):
         count = self.reward_count[state, action]
@@ -174,6 +193,7 @@ class OnlineQLearningIndexPolicy(UnknownModelPolicy):
 
     The online priority score is Q(s,1)-Q(s,0). No P or R matrix is used by the
     policy; it only sees sampled states, actions, rewards, and next states.
+    This is a discounted single-arm Q-difference heuristic, not Q-Whittle.
     """
 
     def __init__(
@@ -192,6 +212,11 @@ class OnlineQLearningIndexPolicy(UnknownModelPolicy):
         self.epsilon_start = float(epsilon_start)
         self.epsilon_min = float(epsilon_min)
         self.active_penalty = float(active_penalty)
+        _check_exploration(self.epsilon_start, self.epsilon_min)
+        if not np.isfinite(self.gamma) or not 0 <= self.gamma < 1:
+            raise ValueError("gamma must lie in [0, 1).")
+        if not np.isfinite(self.active_penalty):
+            raise ValueError("active_penalty must be finite.")
         self.Q = None
         self.visit_count = None
 
@@ -260,18 +285,26 @@ class OnlinePlugInWhittlePolicy(UnknownModelPolicy):
         reward_prior_count=1.0,
     ):
         super().__init__(S, A, N, alpha)
-        self.recompute_interval = int(recompute_interval)
+        self.recompute_interval = positive_integer(recompute_interval, "recompute_interval")
         self.epsilon_start = float(epsilon_start)
         self.epsilon_min = float(epsilon_min)
         self.transition_prior = float(transition_prior)
         self.reward_prior = float(reward_prior)
         self.reward_prior_count = float(reward_prior_count)
+        _check_exploration(self.epsilon_start, self.epsilon_min)
+        if not np.isfinite(self.transition_prior) or self.transition_prior <= 0:
+            raise ValueError("transition_prior must be positive so that every estimated row is defined.")
+        if not np.isfinite(self.reward_prior_count) or self.reward_prior_count < 0 or not np.isfinite(self.reward_prior):
+            raise ValueError("Reward priors must be finite, with a nonnegative count.")
         self.transition_count = None
         self.reward_sum = None
         self.reward_count = None
         self.indices = None
         self.num_index_recomputations = 0
         self.last_recompute_status = "not_started"
+        self.num_index_failures = 0
+        self.num_fallback_decisions = 0
+        self.last_index_error = ""
 
     def reset(self, seed):
         super().reset(seed)
@@ -286,6 +319,9 @@ class OnlinePlugInWhittlePolicy(UnknownModelPolicy):
         self.indices = np.zeros(self.S)
         self.num_index_recomputations = 0
         self.last_recompute_status = "initialized"
+        self.num_index_failures = 0
+        self.num_fallback_decisions = 0
+        self.last_index_error = ""
         self._recompute_indices()
 
     def _epsilon(self):
@@ -314,22 +350,26 @@ class OnlinePlugInWhittlePolicy(UnknownModelPolicy):
                 self.alpha,
             )
             indices = np.asarray(teacher_policy.whittle_indices, dtype=float)
-            if not np.all(np.isfinite(indices)):
-                raise ValueError("Estimated Whittle indices contain NaN/inf.")
+            if indices.shape != (self.S,) or not np.all(np.isfinite(indices)):
+                raise ValueError("Estimated Whittle indices have wrong shape or contain NaN/inf.")
             self.indices = indices
             self.last_recompute_status = "whittle"
-        except Exception:
+        except Exception as exc:
             # Some early empirical models may be numerically awkward. Falling
             # back to immediate reward advantage keeps the online experiment
             # running while more data are collected.
             self.indices = R_hat[:, 1] - R_hat[:, 0]
             self.last_recompute_status = "reward_advantage_fallback"
+            self.num_index_failures += 1
+            self.last_index_error = f"{type(exc).__name__}: {exc}"
 
         self.num_index_recomputations += 1
 
     def select_actions(self, states):
         if self.rng.random() < self._epsilon():
             return self._random_actions()
+        if self.last_recompute_status == "reward_advantage_fallback":
+            self.num_fallback_decisions += 1
         return self._activate_largest_scores(self.indices[states])
 
     def update(self, states, actions, rewards, next_states):
@@ -357,7 +397,7 @@ class KnownWhittleOraclePolicy(UnknownModelPolicy):
 
     def __init__(self, bandit, N, alpha):
         super().__init__(bandit.S, bandit.A, N, alpha)
-        teacher_policy = strategies.WhittleIndexStrategy(bandit, alpha)
+        teacher_policy = strategies.WhittleIndexStrategy(bandit, self.alpha)
         self.indices = np.asarray(teacher_policy.whittle_indices, dtype=float)
 
     def select_actions(self, states):
@@ -369,7 +409,7 @@ class KnownLPPriorityOraclePolicy(UnknownModelPolicy):
 
     def __init__(self, bandit, N, alpha):
         super().__init__(bandit.S, bandit.A, N, alpha)
-        teacher_policy = strategies.LPPriorityStrategy(bandit, alpha)
+        teacher_policy = strategies.LPPriorityStrategy(bandit, self.alpha)
         self.indices = np.asarray(teacher_policy.lp_index, dtype=float)
 
     def select_actions(self, states):
@@ -425,17 +465,35 @@ def simulate_unknown_model(
 
     The policy receives only samples. The hidden environment uses bandit.P and
     bandit.R to generate rewards and next states.
+    Rewards equal R[s,a] (no extra reward noise). Every arm is observed after
+    each step, so N arms yield N samples per period, not one bandit pull.
     """
+    N = positive_integer(N, "N")
+    horizon = positive_integer(horizon, "horizon")
+    if not np.isfinite(tail_fraction) or not 0 < tail_fraction <= 1:
+        raise ValueError("tail_fraction must lie in (0, 1].")
+    if (policy.N, policy.S, policy.A) != (N, bandit.S, bandit.A):
+        raise ValueError("Policy dimensions do not match the simulated environment.")
+    if policy.budget != integer_budget(policy.alpha, N):
+        raise ValueError("Policy budget does not match its activation fraction.")
+    initial_state = np.asarray(initial_state, dtype=float)
+    if (initial_state.shape != (bandit.S,) or not np.isfinite(initial_state).all()
+            or np.any(initial_state < 0) or not np.isclose(initial_state.sum(), 1.0, rtol=0, atol=1e-10)):
+        raise ValueError("initial_state must be a finite probability distribution.")
+    initial_state = initial_state / initial_state.sum()
     rng = np.random.default_rng(seed)
-    policy.reset(seed + 1)
+    policy.reset(None if seed is None else seed + 1)
 
     states = rng.choice(bandit.S, size=N, p=initial_state)
     reward_history = np.zeros(horizon)
 
     for t in range(horizon):
-        actions = np.asarray(policy.select_actions(states), dtype=int)
+        actions = np.asarray(policy.select_actions(states))
         if actions.shape != (N,):
             raise ValueError("Policy returned an action vector with wrong shape.")
+        if not np.isin(actions, [0, 1]).all():
+            raise ValueError("Policy actions must be binary (0 or 1), not rounded scores.")
+        actions = actions.astype(int)
         if np.sum(actions) != policy.budget:
             raise ValueError("Policy did not satisfy the exact activation budget.")
 
@@ -451,8 +509,8 @@ def simulate_unknown_model(
                 p=bandit.P[state, action, :],
             )
 
-        policy.update(states, actions, rewards, next_states)
         reward_history[t] = np.mean(rewards)
+        policy.update(states, actions, rewards, next_states)
         states = next_states
 
     tail_start = int((1.0 - tail_fraction) * horizon)
@@ -461,4 +519,10 @@ def simulate_unknown_model(
         "tail_mean_reward": float(np.mean(reward_history[tail_start:])),
         "reward_history": reward_history,
         "final_states": states,
+        "tail_start": tail_start,
+        "tail_steps": horizon - tail_start,
+        "num_index_recomputations": getattr(policy, "num_index_recomputations", 0),
+        "num_index_failures": getattr(policy, "num_index_failures", 0),
+        "num_fallback_decisions": getattr(policy, "num_fallback_decisions", 0),
+        "last_index_error": getattr(policy, "last_index_error", ""),
     }

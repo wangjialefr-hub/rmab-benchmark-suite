@@ -47,10 +47,12 @@ importlib.reload(make_policy_module)
 importlib.reload(extra_instances_module)
 
 from known_model_extra_instances import build_extended_known_model_instance_library
+from benchmark_metadata import experiment_axes, write_experiment_settings
+from simulation_utils import integer_budget
 
 
 # Computation-cost results are kept separate from the reward benchmark.
-OUTPUT_DIR = CURRENT_DIR / "computation_cost_outputs"
+OUTPUT_DIR = CURRENT_DIR / "computation_cost_outputs" / "corrected_v2"
 
 
 # ============================================================
@@ -97,18 +99,13 @@ def simulate_uncached(bandit, policy, initial_state, N, horizon, seed):
     omits its computed_values lookup so the measured time is genuine.
     """
     np.random.seed(seed)
+    if hasattr(policy, "reset"):
+        policy.reset()
     state_x = strategies.round_state_to_integer(initial_state, N)
     rewards = np.zeros(horizon)
 
     for t in range(horizon):
-        next_y = policy.next_y(state_x, N)
-
-        # FTVA and RoundRobin simulate individual arm transitions internally.
-        if policy.X is None:
-            next_x, reward = bandit.next_x_from_y(next_y, N)
-        else:
-            next_x = policy.X
-            reward = policy.reward
+        next_x, reward, _ = strategies.simulation_step(bandit, policy, state_x, N)
 
         rewards[t] = reward
         state_x = next_x
@@ -165,7 +162,9 @@ def estimate_runtime_scaling(group):
     valid = group[
         (group["mean_simulation_seconds"] > 0)
         & np.isfinite(group["mean_simulation_seconds"])
-    ]
+        & (group["N"] > 0)
+        & np.isfinite(group["N"])
+    ].drop_duplicates("N")
     if len(valid) < 2:
         return pd.Series(
             {
@@ -249,8 +248,11 @@ def save_plots(setup_summary, cost_summary, output_dir):
         ].sort_values("mean_setup_seconds")
         if not instance_setup.empty:
             fig, ax = plt.subplots()
+            labels = instance_setup["policy"]
+            if labels.duplicated().any():
+                labels = labels + " (alpha=" + instance_setup["alpha"].map(lambda x: f"{x:.4g}") + ")"
             ax.barh(
-                instance_setup["policy"],
+                labels,
                 instance_setup["mean_setup_seconds"],
             )
             ax.set(
@@ -286,21 +288,51 @@ def run_computation_cost_benchmark(
     No simulation cache is accepted as an argument by design. Every simulation
     is recomputed, while the original rmab_cache directory remains untouched.
     """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
+    n_values, policy_names = experiment_axes(
+        n_values, policy_names, num_repetitions=num_repetitions,
+        setup_repetitions=setup_repetitions, simulation_horizon=simulation_horizon,
+    )
+    instance_names = list(instance_names)
+    if not instance_names or len(set(instance_names)) != len(instance_names):
+        raise ValueError("Select distinct, nonempty instance names.")
     instance_library = build_extended_known_model_instance_library(bandit_lp)
     missing = [name for name in instance_names if name not in instance_library]
     if missing:
         raise ValueError(f"Unknown instances: {missing}")
 
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_experiment_settings(
+        output_dir, source_files=["run_computation_cost_benchmark.py", "benchmark_metadata.py",
+                                  "bandit_lp.py", "strategies.py", "make_policy.py",
+                                  "simulation_utils.py", "rmab_instances.py", "known_model_extra_instances.py"],
+        instances=instance_names, policies=policy_names, N=n_values,
+        num_repetitions=num_repetitions, setup_repetitions=setup_repetitions,
+        horizon=simulation_horizon, mc_seed=MC_SEED, lp_update_horizon=LP_UPDATE_HORIZON,
+        simulation_cache=False, setup_scope="one cold setup per instance, policy and effective alpha",
+        simulation_scope="reset, initial state, decisions, rewards and transitions; excludes policy construction and file I/O",
+        qwhittle_training=dict(gamma=make_policy_module.QWHITTLE_GAMMA,
+                               num_penalties=make_policy_module.QWHITTLE_NUM_PENALTIES,
+                               steps_per_penalty=make_policy_module.QWHITTLE_STEPS_PER_PENALTY,
+                               seed=make_policy_module.QWHITTLE_TRAINING_SEED),
+    )
+
+    # N can change the feasible activation fraction through integer rounding.
+    # Measure setup once for each actual fraction, not for an infeasible alpha.
+    experiments = []
+    for name in instance_names:
+        by_alpha = {}
+        for N in n_values:
+            alpha = integer_budget(instance_library[name].default_alpha, N) / N
+            by_alpha.setdefault(alpha, []).append(N)
+        experiments.extend((name, alpha, sizes) for alpha, sizes in by_alpha.items())
+
     setup_rows = []
     simulation_rows = []
 
-    for instance_name in instance_names:
+    for instance_name, alpha, run_n_values in experiments:
         spec = instance_library[instance_name]
         bandit = spec.bandit
-        alpha = spec.default_alpha
 
         print(
             f"\nInstance: {instance_name} | "
@@ -365,11 +397,22 @@ def run_computation_cost_benchmark(
 
             if not setup_succeeded:
                 print(f" failed: {setup_error}")
+                for N in run_n_values:
+                    for rep in range(num_repetitions):
+                        simulation_rows.append(dict(
+                            instance=instance_name, policy=policy_name, S=bandit.S, A=bandit.A,
+                            alpha=alpha, online_state_representation=online_state_representation(policy_name),
+                            N=N, replication=rep, seed=MC_SEED + rep, horizon=simulation_horizon,
+                            mean_reward=np.nan, simulation_seconds=np.nan, seconds_per_step=np.nan,
+                            status="failed", error=f"Policy setup failed: {setup_error}",
+                        ))
+                pd.DataFrame(setup_rows).to_csv(output_dir / "setup_times_raw.csv", index=False)
+                pd.DataFrame(simulation_rows).to_csv(output_dir / "simulation_times_raw.csv", index=False)
                 continue
 
             print(" done; measuring online simulation.")
 
-            for N in n_values:
+            for N in run_n_values:
                 failures = 0
                 for rep in range(num_repetitions):
                     seed = MC_SEED + rep
@@ -443,17 +486,18 @@ def run_computation_cost_benchmark(
 
                 status = "ok" if failures == 0 else f"{failures} failed"
                 print(f"    N={N}: {status}")
+            pd.DataFrame(setup_rows).to_csv(output_dir / "setup_times_raw.csv", index=False)
+            pd.DataFrame(simulation_rows).to_csv(output_dir / "simulation_times_raw.csv", index=False)
 
     setup_raw = pd.DataFrame(setup_rows)
     simulation_raw = pd.DataFrame(simulation_rows)
 
     setup_ok = setup_raw[setup_raw["status"] == "ok"]
     setup_summary = (
-        setup_ok.groupby(["instance", "policy"], as_index=False)
+        setup_ok.groupby(["instance", "policy", "alpha"], as_index=False)
         .agg(
             S=("S", "first"),
             A=("A", "first"),
-            alpha=("alpha", "first"),
             online_state_representation=("online_state_representation", "first"),
             mean_setup_seconds=("setup_seconds", "mean"),
             min_setup_seconds=("setup_seconds", "min"),
@@ -482,9 +526,9 @@ def run_computation_cost_benchmark(
 
     cost_summary = simulation_summary.merge(
         setup_summary[
-            ["instance", "policy", "mean_setup_seconds", "min_setup_seconds"]
+            ["instance", "policy", "alpha", "mean_setup_seconds", "min_setup_seconds"]
         ],
-        on=["instance", "policy"],
+        on=["instance", "policy", "alpha"],
         how="left",
     )
     cost_summary["estimated_cold_total_seconds"] = (
@@ -492,12 +536,13 @@ def run_computation_cost_benchmark(
         + cost_summary["mean_simulation_seconds"]
     )
 
-    scaling_df = (
-        simulation_summary.groupby(["instance", "policy"])
-        .apply(estimate_runtime_scaling, include_groups=False)
-        .reset_index()
-        .sort_values(["instance", "runtime_scaling_gamma"])
-    )
+    scaling_rows = []
+    for (instance, policy, alpha), group in simulation_summary.groupby(["instance", "policy", "alpha"]):
+        scaling_rows.append(dict(instance=instance, policy=policy, alpha=alpha,
+                                 **estimate_runtime_scaling(group).to_dict()))
+    scaling_df = pd.DataFrame(scaling_rows, columns=[
+        "instance", "policy", "alpha", "runtime_scaling_gamma", "r_squared", "num_fit_points",
+    ]).sort_values(["instance", "runtime_scaling_gamma"])
 
     setup_raw.to_csv(output_dir / "setup_times_raw.csv", index=False)
     simulation_raw.to_csv(output_dir / "simulation_times_raw.csv", index=False)

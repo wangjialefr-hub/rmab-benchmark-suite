@@ -1,14 +1,14 @@
 """
 Policy factory for RMAB benchmark experiments.
 
-This file is your own layer. It does not modify the teacher implementations in
-bandit_lp.py or strategies.py. It only creates policy objects in a consistent
-way, including a few simple baseline policies.
+Creates policy objects through a common interface, including simple baselines.
+Numerical corrections to the reference simulator are recorded in CORRECTIONS.md.
 """
 
 import hashlib
 
 import numpy as np
+from simulation_utils import integer_budget, state_counts
 
 
 POLICY_NAMES = [
@@ -175,6 +175,13 @@ class RoundRobinStrategy:
         self.arm_states = None
         self.pointer = 0
 
+    def reset(self):
+        """Start a new replication without reusing individual arm states."""
+        self.arm_states = None
+        self.pointer = 0
+        self.X = None
+        self.reward = None
+
     def hashname(self):
         h = hashlib.new("sha256")
         h.update(b"round-robin")
@@ -189,7 +196,7 @@ class RoundRobinStrategy:
             self.arm_states = self._initialize_arm_states(state_x, N)
             self.pointer = 0
 
-        budget = int(self.alpha * N)
+        budget = integer_budget(self.alpha, N)
         budget = min(max(budget, 0), N)
 
         actions = np.zeros(N, dtype=int)
@@ -210,21 +217,7 @@ class RoundRobinStrategy:
         return y
 
     def _initialize_arm_states(self, state_x, N):
-        state_x = np.asarray(state_x, dtype=float)
-        states = np.zeros(N, dtype=int)
-
-        n = 0
-        for s in range(self.bandit.S):
-            count = int(N * state_x[s])
-            states[n:n + count] = s
-            n += count
-
-        if n < N:
-            residual = np.maximum(state_x, 0.0)
-            residual = residual / residual.sum()
-            states[n:] = np.random.choice(self.bandit.S, size=N - n, p=residual)
-
-        return states
+        return np.repeat(np.arange(self.bandit.S), state_counts(state_x, N))
 
     def _x_from_states(self, states):
         x = np.zeros(self.bandit.S)

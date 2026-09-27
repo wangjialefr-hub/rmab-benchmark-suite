@@ -35,9 +35,10 @@ from heterogeneous_rmab import (
     make_heterogeneous_policy,
     simulate_heterogeneous,
 )
+from benchmark_metadata import experiment_axes, positive_integer, write_experiment_settings
 
 
-OUTPUT_DIR = CURRENT_DIR / "heterogeneous_outputs"
+OUTPUT_DIR = CURRENT_DIR / "heterogeneous_outputs" / "corrected_v2"
 
 
 # ============================================================
@@ -61,7 +62,7 @@ POLICY_NAMES = [
     "HeterogeneousMyopic",
     "RandomActivation",
     "RoundRobin",
-    # "HeterogeneousLPUpdate",  # implemented, but very slow: solves an LP every step.
+    # "HeterogeneousLPUpdate",  # slow: solves an LP for each new population state.
 ]
 
 INSTANCE_BUILDERS = {
@@ -78,7 +79,7 @@ def safe_filename(name):
     return re.sub(r'[ /\\:]', "_", name)
 
 
-def plot_metric(summary_df, instance_name, metric, ylabel, suffix):
+def plot_metric(summary_df, instance_name, metric, ylabel, suffix, output_dir=OUTPUT_DIR):
     """Plot one line per policy; confidence intervals are intentionally omitted."""
     fig, ax = plt.subplots(figsize=(7.2, 4.8), dpi=150)
     instance_df = summary_df[summary_df["instance"] == instance_name]
@@ -97,15 +98,16 @@ def plot_metric(summary_df, instance_name, metric, ylabel, suffix):
     ax.set_xscale("log")
     if "seconds" in metric:
         ax.set_yscale("log")
-    ax.set_xticks(N_VALUES)
-    ax.set_xticklabels([str(n) for n in N_VALUES])
+    plotted_n = sorted(instance_df["N"].unique())
+    ax.set_xticks(plotted_n)
+    ax.set_xticklabels([str(n) for n in plotted_n])
     ax.grid(alpha=0.25)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.legend(frameon=False, fontsize=9)
     fig.tight_layout()
     fig.savefig(
-        OUTPUT_DIR / f"{safe_filename(instance_name)}_{suffix}.png",
+        Path(output_dir) / f"{safe_filename(instance_name)}_{suffix}.png",
         bbox_inches="tight",
         dpi=300,
     )
@@ -133,9 +135,28 @@ def run_heterogeneous_benchmark(
     index computation. simulation_seconds measures online decisions plus arm
     transitions. No cache is used.
     """
-    global OUTPUT_DIR
-    OUTPUT_DIR = Path(output_dir)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    n_values, policy_names = experiment_axes(
+        n_values, policy_names, num_monte_carlo=num_monte_carlo,
+        simulation_horizon=simulation_horizon,
+    )
+    if not instance_builders:
+        raise ValueError("Select at least one instance builder.")
+    if num_arm_types is not None:
+        num_arm_types = positive_integer(num_arm_types, "num_arm_types")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_experiment_settings(
+        output_dir, source_files=["run_heterogeneous_benchmark.py", "benchmark_metadata.py",
+                                  "heterogeneous_rmab.py", "bandit_lp.py", "strategies.py",
+                                  "simulation_utils.py", "known_model_extra_instances.py", "rmab_instances.py"],
+        instances=list(instance_builders), policies=policy_names, N=n_values,
+        num_monte_carlo=num_monte_carlo, horizon=simulation_horizon, mc_seed=MC_SEED,
+        num_arm_types=num_arm_types, simulation_cache=False,
+        setup_repetitions=1,
+        setup_scope="policy construction once per instance, N and policy; no prior grouped-model cache",
+        simulation_scope="policy reset, initial states, decisions, rewards and transitions; excludes policy construction and file I/O",
+        lp_update_cache="reused within one simulation only; cleared on reset",
+    )
 
     setup_rows = []
     raw_rows = []
@@ -149,7 +170,7 @@ def run_heterogeneous_benchmark(
                 N=N,
                 num_types=num_arm_types,
             )
-            distinct_models = len(np.unique(environment.type_ids))
+            distinct_models = len({arm.hashname() for arm in environment.arms})
             print(
                 f"  N={N}, budget={environment.budget}, "
                 f"distinct arm models={distinct_models}"
@@ -157,6 +178,9 @@ def run_heterogeneous_benchmark(
 
             for policy_name in policy_names:
                 try:
+                    # Count grouping work for every policy that needs it.
+                    if hasattr(environment, "_model_groups_cache"):
+                        del environment._model_groups_cache
                     setup_start = time.perf_counter()
                     policy = make_heterogeneous_policy(
                         policy_name,
@@ -190,6 +214,17 @@ def run_heterogeneous_benchmark(
 
                 if policy is None:
                     print(f"    {policy_name}: setup failed: {setup_error}")
+                    for replication in range(num_monte_carlo):
+                        raw_rows.append(dict(
+                            instance=instance_name, environment_name=environment.name,
+                            policy=policy_name, N=N, alpha=environment.alpha, budget=environment.budget,
+                            num_distinct_models=distinct_models, replication=replication,
+                            seed=MC_SEED + replication, horizon=simulation_horizon,
+                            mean_reward=np.nan, simulation_seconds=np.nan, seconds_per_step=np.nan,
+                            status="failed", error=f"Policy setup failed: {setup_error}",
+                        ))
+                    pd.DataFrame(setup_rows).to_csv(output_dir / "heterogeneous_setup_times.csv", index=False)
+                    pd.DataFrame(raw_rows).to_csv(output_dir / "heterogeneous_raw_results.csv", index=False)
                     continue
 
                 failures = 0
@@ -255,6 +290,8 @@ def run_heterogeneous_benchmark(
                     f"    {policy_name}: {status_text}, "
                     f"setup={setup_seconds:.4f}s"
                 )
+                pd.DataFrame(setup_rows).to_csv(output_dir / "heterogeneous_setup_times.csv", index=False)
+                pd.DataFrame(raw_rows).to_csv(output_dir / "heterogeneous_raw_results.csv", index=False)
 
     setup_df = pd.DataFrame(setup_rows)
     raw_df = pd.DataFrame(raw_rows)
@@ -288,15 +325,15 @@ def run_heterogeneous_benchmark(
     )
 
     setup_df.to_csv(
-        OUTPUT_DIR / "heterogeneous_setup_times.csv",
+        output_dir / "heterogeneous_setup_times.csv",
         index=False,
     )
     raw_df.to_csv(
-        OUTPUT_DIR / "heterogeneous_raw_results.csv",
+        output_dir / "heterogeneous_raw_results.csv",
         index=False,
     )
     summary_df.to_csv(
-        OUTPUT_DIR / "heterogeneous_summary.csv",
+        output_dir / "heterogeneous_summary.csv",
         index=False,
     )
 
@@ -308,6 +345,7 @@ def run_heterogeneous_benchmark(
                 "mean_reward",
                 "Average reward per arm",
                 "reward_vs_N",
+                output_dir=output_dir,
             )
             plot_metric(
                 summary_df,
@@ -315,6 +353,7 @@ def run_heterogeneous_benchmark(
                 "setup_seconds",
                 "Policy setup time (seconds)",
                 "setup_time_vs_N",
+                output_dir=output_dir,
             )
             plot_metric(
                 summary_df,
@@ -322,9 +361,10 @@ def run_heterogeneous_benchmark(
                 "mean_simulation_seconds",
                 "Simulation time (seconds)",
                 "simulation_time_vs_N",
+                output_dir=output_dir,
             )
 
-    print(f"\nSaved heterogeneous outputs to:\n{OUTPUT_DIR}")
+    print(f"\nSaved heterogeneous outputs to:\n{output_dir}")
     return {
         "setup": setup_df,
         "raw": raw_df,

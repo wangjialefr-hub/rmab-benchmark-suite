@@ -15,7 +15,8 @@ from known_model_extra_instances import (
     extra_instance_metadata_dataframe,
 )
 from make_policy import POLICY_NAMES, make_policy
-from simulation_cache import cached_lp_upper_bound, cached_simulate_policy
+from simulation_cache import cached_finite_horizon_bound, cached_lp_upper_bound, cached_simulate_policy
+from simulation_utils import integer_budget, state_counts
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -50,7 +51,11 @@ def _run(
     lp_update_horizon,
     cache_dir,
     force_recompute,
+    burn_in=0,
+    include_finite_horizon_bound=False,
 ):
+    configured_alpha = float(alpha)
+    alpha = integer_budget(alpha, N) / N
     result = cached_simulate_policy(
         bandit=bandit,
         policy_name=policy_name,
@@ -64,6 +69,7 @@ def _run(
         cache_dir=cache_dir,
         force_recompute=force_recompute,
         return_info=True,
+        burn_in=burn_in,
     )
     mean_reward, x_values, reward_values, y_values, cache_info = result
     lp_bound, _ = cached_lp_upper_bound(
@@ -74,21 +80,41 @@ def _run(
     )
     gap = lp_bound - mean_reward
     relative_gap = np.nan if abs(lp_bound) <= 1e-12 else gap / abs(lp_bound)
-    return {
+    output = {
         "policy": policy_name,
         "N": int(N),
         "alpha": float(alpha),
+        "configured_alpha": configured_alpha,
+        "active_budget": integer_budget(alpha, N),
         "horizon": int(horizon),
-        "seed": int(seed),
+        "seed": None if seed is None else int(seed),
+        "burn_in": int(burn_in),
+        "total_simulated_steps": int(horizon + burn_in),
         "mean_reward": float(mean_reward),
+        "full_horizon_mean_reward": float(np.mean(reward_values)),
         "lp_upper_bound": float(lp_bound),
         "relative_gap": float(relative_gap),
+        "lp_reference": "stationary_average_reward",
+        "simulation_version": cache_info["simulation_version"],
+        "code_hash": cache_info["code_hash"],
         "cache_hit": bool(cache_info["cache_hit"]),
         "runtime_seconds": float(cache_info["runtime_seconds"]),
         "x_values": x_values,
         "reward_values": reward_values,
         "y_values": y_values,
     }
+    if include_finite_horizon_bound:
+        bound = cached_finite_horizon_bound(
+            bandit=bandit, alpha=alpha, initial_state=state_counts(initial_state, N) / N,
+            time_horizon=horizon + burn_in, cache_dir=cache_dir,
+            force_recompute=force_recompute,
+        )
+        output["finite_horizon_lp_bound"] = bound
+        full_mean = output["full_horizon_mean_reward"]
+        output["finite_horizon_relative_gap"] = (
+            np.nan if abs(bound) <= 1e-12 else (bound - full_mean) / abs(bound)
+        )
+    return output
 
 
 def run_named_experiment(
@@ -102,8 +128,16 @@ def run_named_experiment(
     lp_update_horizon=20,
     cache_dir=DEFAULT_CACHE_DIR,
     force_recompute=False,
+    burn_in=0,
+    include_finite_horizon_bound=False,
 ):
-    """Run one policy on one named homogeneous instance."""
+    """Run one policy on one named homogeneous instance.
+
+    horizon counts measured steps; burn_in adds unscored startup steps. Returned
+    arrays contain both. relative_gap is signed against the stationary LP.
+    The optional finite-horizon comparison uses ALL steps, including burn-in.
+    Noninteger alpha*N is replaced by floor(alpha*N), including in LP policies.
+    """
     library = instance_library()
     if instance_name not in library:
         names = ", ".join(sorted(library))
@@ -122,6 +156,8 @@ def run_named_experiment(
         lp_update_horizon=lp_update_horizon,
         cache_dir=cache_dir,
         force_recompute=force_recompute,
+        burn_in=burn_in,
+        include_finite_horizon_bound=include_finite_horizon_bound,
     )
     output["instance"] = instance_name
     return output
@@ -140,6 +176,8 @@ def run_custom_experiment(
     lp_update_horizon=20,
     cache_dir=DEFAULT_CACHE_DIR,
     force_recompute=False,
+    burn_in=0,
+    include_finite_horizon_bound=False,
 ):
     """Run one policy on user-supplied ``P`` and ``R`` arrays."""
     bandit = bandit_lp.BanditInstance(np.asarray(P, float), np.asarray(R, float))
@@ -156,6 +194,8 @@ def run_custom_experiment(
         lp_update_horizon=lp_update_horizon,
         cache_dir=cache_dir,
         force_recompute=force_recompute,
+        burn_in=burn_in,
+        include_finite_horizon_bound=include_finite_horizon_bound,
     )
     output["instance"] = "custom"
     return output

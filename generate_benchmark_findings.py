@@ -1,440 +1,127 @@
-"""
-Generate report-ready findings from benchmark CSV outputs.
+"""Summarize one corrected known-model experiment, without automatic recommendations."""
 
-Run this after the benchmark scripts. It does not run simulations; it only reads
-existing CSV files and writes compact tables plus a Markdown conclusion draft.
-"""
-
+import argparse
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from paper_config import (
-    DUPLICATE_INSTANCE_GROUPS,
-    PAPER_EXCLUDED_INSTANCES,
-    filter_paper_instances,
+from report_data import (
+    CORRECTED_DATA, CORRECTED_REPORT, complete_reward_ranks,
+    load_corrected_results, write_manifest,
 )
 
 
-CURRENT_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = CURRENT_DIR / "paper_summary_outputs"
-
-
-def read_csv_if_exists(path):
-    path = Path(path)
-    if path.exists():
-        return pd.read_csv(path)
-    return pd.DataFrame()
-
-
 def top_known_reward(summary_final):
-    if summary_final.empty:
-        return pd.DataFrame()
-    return (
-        summary_final.sort_values(
-            ["instance", "mean_reward"],
-            ascending=[True, False],
-        )
-        .groupby("instance", as_index=False)
-        .head(3)
-        [
-            [
-                "instance",
-                "policy",
-                "N",
-                "mean_reward",
-                "mean_relative_gap",
-                "alpha",
-            ]
-        ]
-    )
+    """Include all ties at third place rather than arbitrarily dropping policies."""
+    ranks = summary_final.groupby("instance")["mean_reward"].rank(method="min", ascending=False)
+    return summary_final.loc[ranks <= 3, [
+        "instance", "policy", "N", "mean_reward", "mean_relative_gap", "alpha", "num_runs",
+    ]].sort_values(["instance", "mean_reward", "policy"], ascending=[True, False, True])
 
 
-def top_beta(beta_df):
-    if beta_df.empty:
-        return pd.DataFrame()
-    valid = beta_df[np.isfinite(beta_df["convergence_beta"])]
-    return (
-        valid.sort_values(
-            ["instance", "convergence_beta"],
-            ascending=[True, False],
-        )
-        .groupby("instance", as_index=False)
-        .head(3)
-    )
+def aggregate_known_model_recommendation(summary_final, beta_df, cost_known=None):
+    """Keep the legacy name, but return descriptive ranks, not a weighted score.
 
-
-def summarize_known_cost(cost_df):
-    if cost_df.empty:
-        return pd.DataFrame()
-    return (
-        cost_df.groupby("policy", as_index=False)
-        .agg(
-            mean_setup_seconds=("mean_setup_seconds", "mean"),
-            mean_simulation_seconds=("mean_simulation_seconds", "mean"),
-            mean_total_seconds=("estimated_cold_total_seconds", "mean"),
-            max_total_seconds=("estimated_cold_total_seconds", "max"),
-            rows=("estimated_cold_total_seconds", "size"),
-        )
-        .sort_values("mean_total_seconds", ascending=False)
-    )
-
-
-def summarize_cost_suite(cost_suite):
-    if cost_suite.empty:
-        return pd.DataFrame()
-    return (
-        cost_suite.groupby(["experiment_family", "policy"], as_index=False)
-        .agg(
-            mean_setup_seconds=("setup_seconds", "mean"),
-            mean_online_seconds=("online_seconds", "mean"),
-            mean_total_seconds=("total_seconds", "mean"),
-            max_total_seconds=("total_seconds", "max"),
-            rows=("total_seconds", "size"),
-        )
-        .sort_values(
-            ["experiment_family", "mean_total_seconds"],
-            ascending=[True, False],
-        )
-    )
-
-
-def summarize_unknown(unknown_summary):
-    if unknown_summary.empty:
-        return pd.DataFrame()
-    max_n = unknown_summary["N"].max()
-    valid = unknown_summary[unknown_summary["N"] == max_n]
-    return (
-        valid.sort_values(
-            ["instance", "mean_tail_reward"],
-            ascending=[True, False],
-        )
-        .groupby("instance", as_index=False)
-        .head(4)
-        [
-            [
-                "instance",
-                "policy",
-                "policy_type",
-                "N",
-                "mean_reward",
-                "mean_tail_reward",
-                "mean_runtime_seconds",
-            ]
-        ]
-    )
-
-
-def summarize_heterogeneous(hetero_summary):
-    if hetero_summary.empty:
-        return pd.DataFrame()
-    max_n = hetero_summary["N"].max()
-    valid = hetero_summary[hetero_summary["N"] == max_n]
-    return (
-        valid.sort_values(
-            ["instance", "mean_reward"],
-            ascending=[True, False],
-        )
-        .groupby("instance", as_index=False)
-        .head(4)
-        [
-            [
-                "instance",
-                "policy",
-                "N",
-                "mean_reward",
-                "setup_seconds",
-                "mean_simulation_seconds",
-            ]
-        ]
-    )
-
-
-def aggregate_known_model_recommendation(summary_final, beta_df, cost_known):
+    Reward and signed gap give the same order within an instance. Counting both
+    would double-weight performance. Beta can be undefined for excellent policies
+    whose gap is indistinguishable from zero; it must not be treated as a penalty.
+    Cost is not mixed in without a matched timing protocol.
     """
-    Build a paper-level recommendation table for known-model homogeneous policies.
-
-    Lower score is better. The score combines:
-
-    - reward_rank: average rank by final-N reward across non-duplicate instances;
-    - gap_rank: average rank by clipped relative gap;
-    - cost_rank: rank by total computation cost;
-    - beta_rank: average rank by convergence beta.
-
-    This is intentionally simple and transparent, so it can be explained in a
-    report without pretending to be a universal theorem.
-    """
-    summary_final = filter_paper_instances(summary_final)
-    beta_df = filter_paper_instances(beta_df)
-
-    if summary_final.empty:
-        return pd.DataFrame()
-
-    score_df = summary_final.copy()
-    score_df["clipped_relative_gap"] = score_df["mean_relative_gap"].clip(lower=0.0)
-    score_df["reward_rank"] = score_df.groupby("instance")["mean_reward"].rank(
-        ascending=False,
-        method="average",
-    )
-    score_df["gap_rank"] = score_df.groupby("instance")[
-        "clipped_relative_gap"
-    ].rank(
-        ascending=True,
-        method="average",
-    )
-
-    reward_summary = (
-        score_df.groupby("policy", as_index=False)
-        .agg(
-            avg_reward_rank=("reward_rank", "mean"),
-            avg_gap_rank=("gap_rank", "mean"),
-            avg_final_reward=("mean_reward", "mean"),
-            avg_clipped_relative_gap=("clipped_relative_gap", "mean"),
-            num_instances=("instance", "nunique"),
-        )
-    )
-
-    if not beta_df.empty and "convergence_beta" in beta_df.columns:
-        beta_valid = beta_df[np.isfinite(beta_df["convergence_beta"])].copy()
-        if not beta_valid.empty:
-            beta_valid["beta_rank"] = beta_valid.groupby("instance")[
-                "convergence_beta"
-            ].rank(ascending=False, method="average")
-            beta_summary = (
-                beta_valid.groupby("policy", as_index=False)
-                .agg(
-                    avg_beta_rank=("beta_rank", "mean"),
-                    avg_convergence_beta=("convergence_beta", "mean"),
-                    beta_fit_instances=("instance", "nunique"),
-                )
-            )
-        else:
-            beta_summary = pd.DataFrame()
-    else:
-        beta_summary = pd.DataFrame()
-
-    if not cost_known.empty and "mean_total_seconds" in cost_known.columns:
-        cost_rank = cost_known.copy()
-        cost_rank["cost_rank"] = cost_rank["mean_total_seconds"].rank(
-            ascending=True,
-            method="average",
-        )
-        cost_rank = cost_rank[
-            ["policy", "cost_rank", "mean_total_seconds"]
-        ]
-    else:
-        cost_rank = pd.DataFrame()
-
-    recommendation = reward_summary
-    if not beta_summary.empty:
-        recommendation = recommendation.merge(beta_summary, on="policy", how="left")
-    if not cost_rank.empty:
-        recommendation = recommendation.merge(cost_rank, on="policy", how="left")
-
-    for col in ["avg_beta_rank", "cost_rank"]:
-        if col not in recommendation.columns:
-            recommendation[col] = np.nan
-        recommendation[col] = recommendation[col].fillna(
-            recommendation[col].max(skipna=True) + 1
-        )
-
-    recommendation["overall_score"] = (
-        0.40 * recommendation["avg_reward_rank"]
-        + 0.25 * recommendation["avg_gap_rank"]
-        + 0.20 * recommendation["cost_rank"]
-        + 0.15 * recommendation["avg_beta_rank"]
-    )
-    recommendation["recommendation_note"] = np.where(
-        recommendation["policy"] == "WhittleIndexStrategy",
-        "Strong default when the model is known and index computation is available.",
-        np.where(
-            recommendation["policy"] == "LPupdateStrategy",
-            "Often high reward, but online computation can be expensive.",
-            np.where(
-                recommendation["policy"] == "LPPriorityStrategy",
-                "Cheap and competitive, but less robust on some counterexamples.",
-                "Useful baseline or instance-dependent alternative.",
-            ),
-        ),
-    )
-
-    return recommendation.sort_values("overall_score").reset_index(drop=True)
+    policies = summary_final.attrs.get("policies", sorted(summary_final["policy"].unique()))
+    ranks = complete_reward_ranks(summary_final, summary_final["N"].max())
+    table = pd.DataFrame({"policy": policies})
+    table["avg_reward_rank"] = table["policy"].map(ranks.mean(axis=0))
+    table["shared_instances"] = len(ranks)
+    table["available_instances"] = table["policy"].map(
+        summary_final.groupby("policy")["instance"].nunique()
+    ).fillna(0).astype(int)
+    beta_count = beta_df[np.isfinite(beta_df["convergence_beta"])].groupby("policy").size()
+    table["beta_fit_instances"] = table["policy"].map(beta_count).fillna(0).astype(int)
+    table["interpretation"] = "descriptive reward rank only; no overall recommendation"
+    return table.sort_values(["avg_reward_rank", "policy"], na_position="last").reset_index(drop=True)
 
 
-def dataframe_to_markdown(df, max_rows=20):
-    if df.empty:
-        return "_No data available yet._"
-    return df.head(max_rows).to_markdown(index=False)
-
-
-def write_findings_markdown(
-    output_dir,
-    known_top,
-    beta_top,
-    cost_known,
-    cost_suite,
-    unknown_top,
-    hetero_top,
-    recommendation,
-):
-    lines = [
-        "# Benchmark Findings Draft",
-        "",
-        "This file is generated automatically from the current CSV outputs. "
-        "Rerun the benchmark scripts and then rerun this file to refresh the conclusions.",
-        "",
-        "## 1. Known-model performance",
-        "",
-        "At the largest available N, the strongest policies are usually the "
-        "structured planning/index policies rather than simple baselines. "
-        "The exact ranking is instance-dependent, which supports the benchmark "
-        "motivation: one RMAB policy is not uniformly best across all structures.",
-        "",
-        dataframe_to_markdown(known_top),
-        "",
-        "### Aggregate recommendation",
-        "",
-        "If only one known-model policy must be selected across the benchmark, "
-        "the recommendation table combines reward rank, relative-gap rank, "
-        "computation cost, and convergence beta. This is a practical benchmark "
-        "recommendation rather than a theoretical dominance result.",
-        "",
-        dataframe_to_markdown(recommendation),
-        "",
-        "## 2. Convergence-rate behavior",
-        "",
-        "The convergence beta table estimates how quickly the relative gap to "
-        "the LP upper bound decreases as N grows. Larger beta means faster "
-        "empirical convergence. NaN means the fit was not meaningful, usually "
-        "because the measured gap was non-positive or there were too few valid points.",
-        "",
-        dataframe_to_markdown(beta_top),
-        "",
-        "## 3. Computation cost",
-        "",
-        "Computation cost should be reported separately from reward. LP-Update "
-        "and Q-Whittle-style methods can have substantially higher setup or "
-        "online costs, while priority/index rules are often cheaper online.",
-        "",
-        "### Existing known-model cost output",
-        "",
-        dataframe_to_markdown(cost_known),
-        "",
-        "### Combined cost-suite output",
-        "",
-        dataframe_to_markdown(cost_suite),
-        "",
-        "## 4. Unknown-model online learning",
-        "",
-        "Unknown-model policies should be compared against known-model oracle "
-        "curves, but interpreted separately. OnlinePlugInWhittle is the most "
-        "RMAB-specific learning baseline: it estimates P,R and then computes "
-        "Whittle indices from the learned model.",
-        "",
-        dataframe_to_markdown(unknown_top),
-        "",
-        "## 5. Heterogeneous arms",
-        "",
-        "The heterogeneous experiment studies arms with different P_i,R_i. "
-        "Whittle, LP-Priority, FTVA, and LP-Update now have heterogeneous "
-        "implementations, but LP-Update is expected to be expensive because it "
-        "solves a finite-horizon LP repeatedly.",
-        "",
-        dataframe_to_markdown(hetero_top),
-        "",
-        "## 6. Current paper-level message",
-        "",
-        "- The suite now covers known-model homogeneous RMAB, known-model heterogeneous RMAB, and unknown-model online learning.",
-        "- Instance structure matters: random, counterexample, maintenance, wireless, and deadline instances can produce different policy rankings.",
-        "- Reward alone is not enough; convergence rate and computation cost change the practical ranking.",
-        "- The next strongest addition would be a more theoretically grounded unknown-model RMAB learner, such as UCB/Thompson model learning plus Whittle or LP-based control.",
-        "- Duplicate instance handling: conveyor_eg4action-gap-tb_S8 is excluded because it is identical to hong_counterexample; non-duplicate conveyor examples are retained.",
-        "",
-    ]
-    (output_dir / "benchmark_findings_draft.md").write_text(
-        "\n".join(lines),
-        encoding="utf-8",
-    )
-
-
-def generate_benchmark_findings(output_dir=OUTPUT_DIR):
+def generate_benchmark_findings(output_dir=CORRECTED_REPORT, *, known_model_dir=CORRECTED_DATA):
+    summary, beta, manifest = load_corrected_results(known_model_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    largest_n = int(summary["N"].max())
+    final = summary[summary["N"] == largest_n].copy()
+    top = top_known_reward(final)
+    comparison = aggregate_known_model_recommendation(final, beta)
+    # Save every policy and every unavailable fit, not only a top-beta shortlist.
+    top.to_csv(output_dir / "known_model_top_policies.csv", index=False)
+    beta.to_csv(output_dir / "convergence_beta_diagnostics.csv", index=False)
+    comparison.to_csv(output_dir / "policy_comparison.csv", index=False)
+    final.to_csv(output_dir / "known_model_final_results.csv", index=False)
+    write_manifest(output_dir, manifest)
+    settings = manifest["settings"]
+    text = f"""# Corrected Benchmark Summary
 
-    instance_outputs = CURRENT_DIR / "instance_matrix_outputs"
-    known_cost_outputs = CURRENT_DIR / "computation_cost_outputs"
-    cost_suite_outputs = CURRENT_DIR / "computation_cost_suite_outputs"
-    unknown_outputs = CURRENT_DIR / "unknown_model_outputs"
-    hetero_outputs = CURRENT_DIR / "heterogeneous_outputs"
+Scope: **{manifest['report_scope']}**. This is a data summary, not a final policy recommendation.
 
-    summary_final = read_csv_if_exists(
-        instance_outputs / "summary_final_N500.csv"
-    )
-    summary_final = filter_paper_instances(summary_final)
-    beta_df = read_csv_if_exists(
-        instance_outputs / "convergence_beta_by_instance.csv"
-    )
-    beta_df = filter_paper_instances(beta_df)
-    known_cost_df = read_csv_if_exists(
-        known_cost_outputs / "computation_cost_summary.csv"
-    )
-    known_cost_df = filter_paper_instances(known_cost_df)
-    cost_suite_df = read_csv_if_exists(
-        cost_suite_outputs / "combined_computation_cost_summary.csv"
-    )
-    cost_suite_df = filter_paper_instances(cost_suite_df)
-    unknown_summary = read_csv_if_exists(
-        unknown_outputs / "unknown_model_summary.csv"
-    )
-    hetero_summary = read_csv_if_exists(
-        hetero_outputs / "heterogeneous_summary.csv"
-    )
+Source: `{manifest['source_directory']}`.
 
-    known_top = top_known_reward(summary_final)
-    beta_top_df = top_beta(beta_df)
-    cost_known = summarize_known_cost(known_cost_df)
-    cost_suite = summarize_cost_suite(cost_suite_df)
-    unknown_top = summarize_unknown(unknown_summary)
-    hetero_top = summarize_heterogeneous(hetero_summary)
-    recommendation = aggregate_known_model_recommendation(
-        summary_final,
-        beta_df,
-        cost_known,
-    )
+## Experimental Coverage
 
-    known_top.to_csv(output_dir / "known_model_top_policies.csv", index=False)
-    beta_top_df.to_csv(output_dir / "top_convergence_beta.csv", index=False)
-    cost_known.to_csv(output_dir / "known_model_cost_ranking.csv", index=False)
-    cost_suite.to_csv(output_dir / "combined_cost_ranking.csv", index=False)
-    unknown_top.to_csv(output_dir / "unknown_model_top_policies.csv", index=False)
-    hetero_top.to_csv(output_dir / "heterogeneous_top_policies.csv", index=False)
-    recommendation.to_csv(
-        output_dir / "aggregate_policy_recommendation.csv",
-        index=False,
-    )
+- Instances: {len(settings['instances'])}; selected policies: {len(settings['policies'])}.
+- N: {settings['N']}; replications per combination: {settings['num_monte_carlo']}.
+- Measured horizon: {settings['horizon']}; burn-in: {settings['burn_in']}.
+- Attempted runs: {manifest['attempted_runs']}; failures: {manifest['failed_runs']}.
+- Incomplete successful groups excluded from comparison: {len(manifest['excluded_incomplete_groups'])}.
 
-    write_findings_markdown(
-        output_dir=output_dir,
-        known_top=known_top,
-        beta_top=beta_top_df,
-        cost_known=cost_known,
-        cost_suite=cost_suite,
-        unknown_top=unknown_top,
-        hetero_top=hetero_top,
-        recommendation=recommendation,
-    )
+The complete inputs and code fingerprint are recorded in `report_inputs.json`.
+Completing the default grid does not by itself establish publication readiness.
 
-    print(f"Saved benchmark findings to:\n{output_dir}")
-    return {
-        "known_top": known_top,
-        "beta_top": beta_top_df,
-        "cost_known": cost_known,
-        "cost_suite": cost_suite,
-        "unknown_top": unknown_top,
-        "heterogeneous_top": hetero_top,
-    }
+## Reward at N={largest_n}
+
+The table includes the top three ranks and all ties. Rankings are descriptive;
+small numerical differences are not evidence of statistical significance.
+
+{top.to_markdown(index=False)}
+
+## Cross-Instance Comparison
+
+Average reward ranks below use only instances with complete results for **every
+selected policy**. Missing policies are not ranked on a smaller, easier subset.
+If there is no shared instance, the average ranks are unavailable.
+Exact ties receive their average rank: four policies tied for first receive 2.5.
+
+{comparison.to_markdown(index=False)}
+
+No weighted overall score is reported. Reward and signed gap largely duplicate
+one another as ranking criteria. An unavailable beta is not a poor performance
+score. A reward-versus-cost recommendation also requires matched timing data,
+which this report has not loaded.
+
+## Signed Differences and Beta
+
+`mean_relative_gap` compares the measured reward with the stationary LP value.
+It remains signed. Finite-horizon startup effects and sampling variability can
+produce negative values; those values are not silently replaced by zero.
+The optional finite-horizon LP uses the full trajectory, including burn-in,
+and bounds expected reward rather than each sampled realization.
+
+`convergence_beta_diagnostics.csv` contains every fit, its number of retained
+points, excluded points and status. Beta is a descriptive log-log slope over
+resolved positive gaps, not a proof of convergence. No policy ranking by beta
+is used to select an overall winner.
+
+## Not Included
+
+Historical computation-cost, heterogeneous-arm and unknown-model CSVs were not
+merged into these corrected results. They require their own checked reruns and
+explicitly documented protocols. No conclusion about those experiments is made here.
+"""
+    (output_dir / "benchmark_findings_draft.md").write_text(text, encoding="utf-8")
+    print(f"Saved corrected findings ({manifest['report_scope']}) to:\n{output_dir}")
+    return {"known_top": top, "beta": beta, "comparison": comparison, "manifest": manifest}
 
 
 if __name__ == "__main__":
-    FINDINGS = generate_benchmark_findings()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--known-model-dir", type=Path, default=CORRECTED_DATA)
+    parser.add_argument("--output-dir", type=Path, default=CORRECTED_REPORT)
+    args = parser.parse_args()
+    FINDINGS = generate_benchmark_findings(output_dir=args.output_dir, known_model_dir=args.known_model_dir)

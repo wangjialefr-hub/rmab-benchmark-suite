@@ -4,6 +4,7 @@ This file defines the class "BanditInstance", used to define bandit and solve th
 import hashlib
 import pulp
 import numpy as np
+from simulation_utils import integer_action_counts
 
 class BanditInstance:
     """
@@ -13,9 +14,20 @@ class BanditInstance:
         """
         Initialize a model from the matrices P and R
         """
-        assert len(R.shape) and len(P.shape)==3, "R should be SxA and P should be SxAxS"
+        P, R = np.asarray(P, dtype=float), np.asarray(R, dtype=float)
+        if R.ndim != 2 or P.ndim != 3:
+            raise ValueError("R should be SxA and P should be SxAxS")
         self.S, self.A = R.shape
         assert P.shape == (self.S, self.A, self.S), "R should be SxA and P should be SxAxS"
+        row_sums = P.sum(axis=2, keepdims=True)
+        if (not np.all(np.isfinite(P)) or not np.all(np.isfinite(R))
+                or np.any(P < 0) or not np.allclose(row_sums, 1, atol=1e-7, rtol=0)):
+            raise ValueError("P must contain probability rows and R must be finite.")
+        # Literature tables rounded to eight decimals can sum to 1 +/- 1e-8.
+        # Normalize only such rounding residuals, never an invalid model.
+        self.transition_row_error = float(np.max(np.abs(row_sums - 1)))
+        if self.transition_row_error > 1e-12:
+            P = P / row_sums
         self.P = P
         self.R = R
         # to store values for a given alpha
@@ -50,7 +62,7 @@ class BanditInstance:
                 print(float_to_str(i), end=', ')
             print('\b\n')
 
-    def next_x_from_y(self, Y, N):
+    def next_x_from_y(self, Y, N, *, return_y=False, budget=None):
         """
         Simulate the stochastic system with N arms or the N=inf system.
 
@@ -60,22 +72,23 @@ class BanditInstance:
         
         Return (x, r), where:
         - X is the next state (array of size S)
-        - r is the total reward
+        - r is the average reward per arm for this step.
+        With return_y=True, also return the allocation actually executed.
         """
         assert N == np.inf or isinstance(N, int), "N should be np.inf or an integer"
         assert self.A == 2, "only implemented for two actions because of rounding"
-        reward = np.tensordot(Y, self.R)
         if N == np.inf:
+            Y = np.asarray(Y, dtype=float)
             next_x = np.tensordot(Y, self.P)
         else:
+            counts = integer_action_counts(Y, N, budget=budget)
+            Y = counts / N
             next_x = np.zeros(self.S)
-            for s in range(self.S): # the main part is to treat the rounding problem.
-                int_y_s_1 = int(np.floor(N*Y[s, 1])+1e-6) # we add 1e-6 to avoid rounding errors
-                int_y_s_0 = int(np.round(N*(Y[s,0]+Y[s, 1])-int_y_s_1 ))
-                int_y_s = [int_y_s_0, int_y_s_1]
+            for s in range(self.S):
                 for a in range(self.A):
-                    next_x += np.random.multinomial(int_y_s[a], self.P[s, a, :])/N
-        return next_x, reward
+                    next_x += np.random.multinomial(counts[s, a], self.P[s, a, :])/N
+        reward = float(np.sum(Y * self.R))
+        return (next_x, reward, Y) if return_y else (next_x, reward)
 
     def relaxed_lp_average_reward(self, alpha):
         """
@@ -104,7 +117,9 @@ class BanditInstance:
         # objective    
         prob += pulp.lpSum([variables[s][a]*self.R[s, a] for a in actions for s in states])
 
-        prob.solve(pulp.PULP_CBC_CMD(msg=0))
+        status = prob.solve(pulp.PULP_CBC_CMD(msg=0))
+        if pulp.LpStatus[status] != "Optimal":
+            raise RuntimeError(f"Average-reward LP: {pulp.LpStatus[status]}")
 
         gain = pulp.value(prob.objective)
 
@@ -124,7 +139,7 @@ class BanditInstance:
 
     def relaxed_lp_finite_time(self, alpha, x_init, time, compute_with_rotated_cost=False):
         """
-        Provides the solution of the infinite-horizon LP
+        Solve the finite-horizon relaxation; gain is TOTAL reward over time.
 
         Inputs: 
         - alpha = resource constraint (for now, we restrict our self to two action bandits)
@@ -132,6 +147,8 @@ class BanditInstance:
         Outputs: (gain, y_star, multipliers)
         """
         assert self.A == 2, "this is only implemented for two actions"
+        if not isinstance(time, (int, np.integer)) or time <= 0:
+            raise ValueError("Finite LP time must be a positive integer.")
         actions = range(0, self.A)
         states = range(0, self.S)
         times = range(0, time)
@@ -163,7 +180,9 @@ class BanditInstance:
         else:
             prob += pulp.lpSum([variables[t][s][a]*self.R[s, a] for a in actions for s in states for t in times])
 
-        prob.solve(pulp.PULP_CBC_CMD(msg=0))
+        status = prob.solve(pulp.PULP_CBC_CMD(msg=0))
+        if pulp.LpStatus[status] != "Optimal":
+            raise RuntimeError(f"Finite-horizon LP: {pulp.LpStatus[status]}")
 
         gain = pulp.value(prob.objective)
 
@@ -325,4 +344,3 @@ def float_to_str(a):
         elif is_almost_integer(100*a):
             return '{:.2f}'.format(a)
     return '{:.3f}'.format(a)
-

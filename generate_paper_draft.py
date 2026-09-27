@@ -5,6 +5,7 @@ The draft intentionally separates known-model planning, heterogeneous arms, and
 unknown-model online learning, so the experimental claims stay clean.
 """
 
+import argparse
 from pathlib import Path
 
 import pandas as pd
@@ -39,7 +40,13 @@ def table_or_placeholder(path, max_rows=12):
     return df.head(max_rows).to_markdown(index=False)
 
 
-def generate_paper_draft(output_dir=OUTPUT_DIR):
+def generate_paper_draft(output_dir=OUTPUT_DIR, *, allow_historical_template=False):
+    if not allow_historical_template:
+        raise ValueError(
+            "This is the historical manuscript template, not a corrected report. "
+            "Use generate_benchmark_findings.py and generate_paper_figures.py for checked results. "
+            "Only set allow_historical_template=True to reproduce the old draft explicitly."
+        )
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -224,4 +231,8 @@ This benchmark suite shows that RMAB policy performance is strongly instance-dep
 
 
 if __name__ == "__main__":
-    DRAFT = generate_paper_draft()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--legacy", action="store_true", help="Explicitly reproduce the uncorrected historical template.")
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR / "historical_template")
+    args = parser.parse_args()
+    DRAFT = generate_paper_draft(output_dir=args.output_dir, allow_historical_template=args.legacy)

@@ -12,6 +12,7 @@ unknown_model_outputs/
 computation_cost_outputs/
 computation_cost_suite_outputs/
 paper_summary_outputs/
+verification_outputs/
 RMAB_Report_Figures/
 
 # Historical local copies and run logs

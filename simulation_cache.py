@@ -15,9 +15,19 @@ import json
 import time
 
 import numpy as np
+from simulation_utils import SIMULATION_VERSION
 
 
-CACHE_VERSION = "simulation-cache-v1"
+CACHE_VERSION = "simulation-cache-v2"
+LP_CACHE_VERSION = "simulation-cache-v1"  # Stationary LP definition is unchanged.
+
+
+def simulation_code_hash():
+    """Invalidate trajectories when simulation or policy code changes."""
+    digest = hashlib.sha256()
+    for name in ("bandit_lp.py", "strategies.py", "make_policy.py", "simulation_utils.py"):
+        digest.update((Path(__file__).resolve().parent / name).read_bytes())
+    return digest.hexdigest()[:24]
 
 
 def _hash_array(array):
@@ -37,10 +47,10 @@ def _policy_cache_payload(policy_name):
     also depends on its Q-learning training configuration, so those values must
     be part of the cache key.
     """
-    if str(policy_name) != "QWhittleKnownModel":
-        return {}
-
     import make_policy
+
+    if make_policy.canonical_policy_name(str(policy_name)) != "QWhittleKnownModel":
+        return {}
 
     return {
         "qwhittle_gamma": float(make_policy.QWHITTLE_GAMMA),
@@ -60,16 +70,20 @@ def _cache_key(
     time_horizon,
     seed,
     lp_update_horizon,
+    burn_in=0,
 ):
     """Create a stable cache key for one simulation setting."""
     payload = {
         "cache_version": CACHE_VERSION,
+        "simulation_version": SIMULATION_VERSION,
+        "code_hash": simulation_code_hash(),
         "bandit_hash": bandit.hashname(),
         "policy_name": str(policy_name),
         "alpha": float(alpha),
         "initial_state_hash": _hash_array(initial_state),
         "N": str(N),
         "time_horizon": int(time_horizon),
+        "burn_in": int(burn_in),
         "seed": None if seed is None else int(seed),
         "lp_update_horizon": int(lp_update_horizon),
     }
@@ -94,7 +108,7 @@ def cached_lp_upper_bound(
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     payload = {
-        "cache_version": CACHE_VERSION,
+        "cache_version": LP_CACHE_VERSION,
         "bandit_hash": bandit.hashname(),
         "alpha": float(alpha),
     }
@@ -102,8 +116,9 @@ def cached_lp_upper_bound(
     cache_file = cache_dir / f"lp_bound_{key}.npz"
 
     if cache_file.exists() and not force_recompute:
-        data = np.load(cache_file, allow_pickle=False)
-        return float(data["lp_upper_bound"]), {
+        with np.load(cache_file, allow_pickle=False) as data:
+            bound = float(data["lp_upper_bound"])
+        return bound, {
             "cache_hit": True,
             "cache_file": str(cache_file),
         }
@@ -141,6 +156,7 @@ def cached_simulate_policy(
     force_recompute=False,
     verbose=False,
     return_info=False,
+    burn_in=0,
 ):
     """
     Run strategies.simulate with caching.
@@ -160,8 +176,17 @@ def cached_simulate_policy(
             mean_reward, x_values, reward_values, y_values
 
         If True, additionally return a cache_info dictionary.
+
+    burn_in:
+        Additional startup steps excluded from mean_reward. All returned arrays
+        contain burn_in + time_horizon steps. Without a seed, caching is disabled.
     """
     import strategies
+
+    if not isinstance(burn_in, (int, np.integer)) or burn_in < 0:
+        raise ValueError("burn_in must be a nonnegative integer.")
+    if not isinstance(time_horizon, (int, np.integer)) or time_horizon <= 0:
+        raise ValueError("time_horizon must be a positive integer.")
 
     cache_dir = Path(cache_dir) / "simulations"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -175,23 +200,27 @@ def cached_simulate_policy(
         time_horizon=time_horizon,
         seed=seed,
         lp_update_horizon=lp_update_horizon,
+        burn_in=burn_in,
     )
     cache_file = cache_dir / f"sim_{key}.npz"
 
-    if cache_file.exists() and not force_recompute:
+    if seed is not None and cache_file.exists() and not force_recompute:
         if verbose:
             print(f"[cache hit] {policy_name}, N={N}, seed={seed}")
-        data = np.load(cache_file, allow_pickle=False)
-        result = (
-            float(data["mean_reward"]),
-            data["x_values"],
-            data["reward_values"],
-            data["y_values"],
-        )
+        with np.load(cache_file, allow_pickle=False) as data:
+            result = (
+                float(data["mean_reward"]),
+                data["x_values"],
+                data["reward_values"],
+                data["y_values"],
+            )
+            runtime_seconds = float(data["runtime_seconds"])
         info = {
             "cache_hit": True,
             "cache_file": str(cache_file),
-            "runtime_seconds": float(data["runtime_seconds"]),
+            "runtime_seconds": runtime_seconds,
+            "simulation_version": SIMULATION_VERSION,
+            "code_hash": payload["code_hash"],
         }
         return (*result, info) if return_info else result
 
@@ -206,30 +235,30 @@ def cached_simulate_policy(
         lp_update_horizon=lp_update_horizon,
     )
 
-    # The reference simulator writes its own cache to this relative folder.
-    # A fresh clone does not contain generated directories, so create it here.
-    Path("computed_values").mkdir(parents=True, exist_ok=True)
-
     start = time.perf_counter()
     mean_reward, x_values, reward_values, y_values = strategies.simulate(
         bandit=bandit,
         strategy=policy,
         initial_state=initial_state,
         N=N,
-        time=time_horizon,
+        time=time_horizon + burn_in,
         seed=seed,
+        use_cache=False,  # One cache owner; force_recompute cannot hit an inner cache.
     )
     runtime_seconds = time.perf_counter() - start
+    # Keep the full trajectory so the discarded transient remains inspectable.
+    mean_reward = float(np.mean(reward_values[burn_in:]))
 
-    np.savez_compressed(
-        cache_file,
-        mean_reward=np.array(float(mean_reward)),
-        x_values=x_values,
-        reward_values=reward_values,
-        y_values=y_values,
-        runtime_seconds=np.array(runtime_seconds),
-        metadata=np.array(json.dumps(payload, sort_keys=True)),
-    )
+    if seed is not None:
+        np.savez_compressed(
+            cache_file,
+            mean_reward=np.array(float(mean_reward)),
+            x_values=x_values,
+            reward_values=reward_values,
+            y_values=y_values,
+            runtime_seconds=np.array(runtime_seconds),
+            metadata=np.array(json.dumps(payload, sort_keys=True)),
+        )
 
     result = (
         float(mean_reward),
@@ -239,7 +268,32 @@ def cached_simulate_policy(
     )
     info = {
         "cache_hit": False,
-        "cache_file": str(cache_file),
+        "cache_file": str(cache_file) if seed is not None else "",
         "runtime_seconds": runtime_seconds,
+        "simulation_version": SIMULATION_VERSION,
+        "code_hash": payload["code_hash"],
     }
     return (*result, info) if return_info else result
+
+
+def cached_finite_horizon_bound(*, bandit, alpha, initial_state, time_horizon,
+                                cache_dir="rmab_cache", force_recompute=False):
+    """LP upper bound on EXPECTED average reward over the same finite horizon.
+
+    Pass the actually rounded initial distribution. A sampled trajectory can
+    exceed this expectation bound; such a signed difference is not clipped.
+    """
+    payload = {"version": "finite-lp-v1", "model": bandit.hashname(),
+               "alpha": float(alpha), "initial": _hash_array(initial_state),
+               "horizon": int(time_horizon)}
+    key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:24]
+    folder = Path(cache_dir) / "finite_lp_bounds"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"finite_{key}.npz"
+    if path.exists() and not force_recompute:
+        with np.load(path, allow_pickle=False) as data:
+            return float(data["bound"])
+    gain, _ = bandit.relaxed_lp_finite_time(alpha, initial_state, time_horizon)
+    bound = float(gain / time_horizon)
+    np.savez_compressed(path, bound=bound, metadata=json.dumps(payload, sort_keys=True))
+    return bound

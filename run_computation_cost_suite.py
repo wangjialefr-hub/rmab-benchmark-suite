@@ -12,6 +12,8 @@ separate folder.
 """
 
 import importlib
+import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -30,13 +32,14 @@ import run_computation_cost_benchmark as known_cost_module
 import run_heterogeneous_benchmark as heterogeneous_cost_module
 import run_unknown_model_benchmark as unknown_cost_module
 from paper_config import filter_paper_instances
+from simulation_utils import SIMULATION_VERSION
 
 importlib.reload(known_cost_module)
 importlib.reload(heterogeneous_cost_module)
 importlib.reload(unknown_cost_module)
 
 
-OUTPUT_DIR = CURRENT_DIR / "computation_cost_suite_outputs"
+OUTPUT_DIR = CURRENT_DIR / "computation_cost_suite_outputs" / "corrected_v2"
 
 
 # ============================================================
@@ -148,10 +151,16 @@ def normalize_heterogeneous_cost(summary):
 
 def normalize_unknown_cost(summary):
     df = summary.copy()
+    required = {"policy_type", "mean_setup_seconds", "mean_simulation_seconds"}
+    if not required.issubset(df.columns):
+        raise ValueError("Online timing requires the corrected split timers and oracle labels; rerun old results.")
+    if not df["policy_type"].isin(["known_model_oracle", "unknown_model_online"]).all():
+        raise ValueError("Online timing contains an unrecognized policy type.")
+    oracle = df["policy_type"].eq("known_model_oracle")
     return pd.DataFrame(
         {
             "experiment_family": "unknown_model_online",
-            "model_knowledge": "unknown_P_R",
+            "model_knowledge": np.where(oracle, "known_P_R_oracle", "unknown_P_R"),
             "arm_structure": "homogeneous_environment_explicit_arms",
             "instance": df["instance"],
             "policy": df["policy"],
@@ -160,11 +169,11 @@ def normalize_unknown_cost(summary):
             "A": df["A"],
             "alpha": df["alpha"],
             "reward_metric": df["mean_tail_reward"],
-            "setup_seconds": np.nan,
-            "online_seconds": df["mean_runtime_seconds"],
-            "seconds_per_step": df["mean_runtime_seconds"] / df["horizon"],
+            "setup_seconds": df["mean_setup_seconds"],
+            "online_seconds": df["mean_simulation_seconds"],
+            "seconds_per_step": df["mean_simulation_seconds"] / df["horizon"],
             "total_seconds": df["mean_runtime_seconds"],
-            "cost_scope": "online_learning_plus_simulation",
+            "cost_scope": "construction_plus_learning_and_explicit_arm_simulation",
         }
     )
 
@@ -198,20 +207,24 @@ def summarize_combined_cost(combined):
 def write_cost_readme(output_dir):
     text = """# Computation Cost Suite
 
-This folder combines timing results from three experiment families.
+This folder combines timing results from the explicitly selected experiment families.
+The corrected default includes known-model homogeneous and heterogeneous experiments.
+Unknown-model timing remains exploratory and requires explicit opt-in.
 
 - `known_model_homogeneous`: algorithms know the shared true P,R.
 - `known_model_heterogeneous`: algorithms know each arm type's P_i,R_i.
-- `unknown_model_online`: algorithms do not know P,R and learn from samples.
+- `unknown_model_online`: an online-learning protocol including known-model reference oracles. Check `model_knowledge` to distinguish learners from oracles.
 
 Important interpretation:
 
 - `setup_seconds` is preprocessing time, such as LP solving, Whittle-index computation, or Q-Whittle training.
 - `online_seconds` is the time spent making decisions and simulating transitions.
 - `total_seconds` is setup + online time when both are separately measured.
-- For unknown-model online policies, learning happens during online interaction, so setup is left as NaN and `total_seconds = online_seconds`.
+- For the online protocol, `setup_seconds` measures construction (including true-model oracle preprocessing). `online_seconds` measures reset, interactions and learning; `total_seconds` is their sum. Passive-arm outcomes are observed, and learned tables pool all N arm samples each period.
 
-`HeterogeneousLPUpdate` is implemented but not enabled by default because it solves a finite-horizon LP at each decision time and can be very slow.
+`HeterogeneousLPUpdate` is implemented but not enabled by default because solving a finite-horizon LP for each new population state can be very slow. Its within-trajectory solve cache is cleared between replications.
+
+These times include environment simulation, not only policy decision time. Average times over different sets of successful instances are not a controlled algorithm ranking; check coverage and raw failure records first.
 """
     (output_dir / "README_computation_cost_suite.md").write_text(
         text,
@@ -219,42 +232,50 @@ Important interpretation:
     )
 
 
-def read_csv_if_exists(path):
+def read_corrected_cost(path):
+    """Refuse historical or stale timing files instead of silently combining them."""
     path = Path(path)
-    if path.exists():
-        return pd.read_csv(path)
-    return pd.DataFrame()
+    settings_path = path.parent / "experiment_settings.json"
+    if not path.is_file() or not settings_path.is_file():
+        raise FileNotFoundError(f"Missing corrected timing data or metadata: {path}")
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    if settings.get("simulation_version") != SIMULATION_VERSION or not settings.get("source_sha256"):
+        raise ValueError(f"Missing corrected simulator provenance: {settings_path}")
+    for name, expected_hash in settings["source_sha256"].items():
+        source = (CURRENT_DIR / name).resolve()
+        if source.parent != CURRENT_DIR or not source.is_file():
+            raise ValueError(f"Unknown timing source file: {name}")
+        if hashlib.sha256(source.read_bytes()).hexdigest() != expected_hash:
+            raise ValueError(f"Timing was generated by different code ({name}); rerun before collecting it.")
+    return pd.read_csv(path)
 
 
-def collect_existing_computation_cost_outputs(output_dir=OUTPUT_DIR):
+def collect_existing_computation_cost_outputs(
+    output_dir=OUTPUT_DIR, *,
+    known_dir=known_cost_module.OUTPUT_DIR,
+    heterogeneous_dir=heterogeneous_cost_module.OUTPUT_DIR,
+    unknown_dir=None,
+):
     """
     Combine cost CSV files that already exist, without rerunning simulations.
 
-    Use this when you want a report table immediately. Use
-    run_computation_cost_suite() when you want to recompute all timings from
-    scratch.
+    Source folders require matching code fingerprints. Pass None to omit a
+    family. Online results require an explicit corrected unknown_dir; no
+    historical unknown-model results are imported by this collector.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     frames = []
 
-    known_cost = read_csv_if_exists(
-        CURRENT_DIR / "computation_cost_outputs" / "computation_cost_summary.csv"
-    )
-    if not known_cost.empty:
+    if known_dir is not None:
+        known_cost = read_corrected_cost(Path(known_dir) / "computation_cost_summary.csv")
         frames.append(normalize_known_cost(known_cost))
-
-    heterogeneous_cost = read_csv_if_exists(
-        CURRENT_DIR / "heterogeneous_outputs" / "heterogeneous_summary.csv"
-    )
-    if not heterogeneous_cost.empty:
+    if heterogeneous_dir is not None:
+        heterogeneous_cost = read_corrected_cost(Path(heterogeneous_dir) / "heterogeneous_summary.csv")
         frames.append(normalize_heterogeneous_cost(heterogeneous_cost))
-
-    unknown_cost = read_csv_if_exists(
-        CURRENT_DIR / "unknown_model_outputs" / "unknown_model_summary.csv"
-    )
-    if not unknown_cost.empty:
+    if unknown_dir is not None:
+        unknown_cost = read_corrected_cost(Path(unknown_dir) / "unknown_model_summary.csv")
         frames.append(normalize_unknown_cost(unknown_cost))
 
     if frames:
@@ -288,8 +309,10 @@ def run_computation_cost_suite(
     output_dir=OUTPUT_DIR,
     run_known=True,
     run_heterogeneous=True,
-    run_unknown=True,
+    run_unknown=False,
 ):
+    if not any((run_known, run_heterogeneous, run_unknown)):
+        raise ValueError("Select at least one experiment family.")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -348,7 +371,7 @@ def run_computation_cost_suite(
         output_dir / "combined_computation_cost_summary.csv",
         index=False,
     )
-    cost_ranking = summarize_combined_cost(combined)
+    cost_ranking = summarize_combined_cost(combined) if not combined.empty else pd.DataFrame()
     cost_ranking.to_csv(
         output_dir / "combined_computation_cost_ranking.csv",
         index=False,
